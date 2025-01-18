@@ -26,11 +26,13 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        # 先安装 PyQt5，避免依赖冲突
-        pip install PyQt5==5.15.9
+        # 先安装 PyQt5 和 pywin32，避免依赖冲突
+        pip install PyQt5==5.15.9 pywin32==305
         pip install -r requirements.txt
         # 安装打包工具和图标转换工具
         pip install pyinstaller==6.3.0 pillow
+        # 验证关键依赖安装
+        python -c "import win32api; import PyQt5; print('Dependencies verified')"
         
     - name: Convert PNG to ICO
       run: |
@@ -54,6 +56,8 @@ jobs:
           --name "FileTransfer" `
           --icon "assets/icon.ico" `
           --version-file "version.txt" `
+          --hidden-import win32api `
+          --hidden-import win32con `
           --hidden-import PyQt5 `
           --hidden-import PyQt5.QtCore `
           --hidden-import PyQt5.QtGui `

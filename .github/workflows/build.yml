@@ -12,6 +12,8 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write
 
     steps:
     - uses: actions/checkout@v4
@@ -30,43 +32,50 @@ jobs:
     - name: Get version
       id: get_version
       run: |
-        if ("${{ github.ref_type }}" -eq "tag") {
-          echo "version=${{ github.ref_name }}" >> $env:GITHUB_OUTPUT
+        $version = if ($env:GITHUB_REF_TYPE -eq 'tag') {
+          $env:GITHUB_REF_NAME
         } else {
-          echo "version=dev-${{ github.sha }}" >> $env:GITHUB_OUTPUT
+          "dev-$env:GITHUB_SHA".Substring(0, 12)
         }
+        echo "VERSION=$version" >> $env:GITHUB_ENV
       shell: pwsh
         
     - name: Build with PyInstaller
       run: |
         pyinstaller --noconfirm --onefile --windowed `
-          --name "FileTransfer-${{ steps.get_version.outputs.version }}" `
+          --name "FileTransfer" `
           --version-file "version.txt" `
           main.py
+        
+    - name: Rename executable
+      run: |
+        Move-Item "dist/FileTransfer.exe" "dist/FileTransfer-$env:VERSION.exe" -Force
+      shell: pwsh
         
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: FileTransfer-${{ steps.get_version.outputs.version }}
-        path: dist/FileTransfer-${{ steps.get_version.outputs.version }}.exe
+        name: FileTransfer-${{ env.VERSION }}
+        path: dist/FileTransfer-${{ env.VERSION }}.exe
         
     - name: Create Release
-      if: startsWith(github.ref, 'refs/tags/v')
+      if: startsWith(github.ref, 'refs/tags/')
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       uses: softprops/action-gh-release@v1
       with:
-        name: 文件快传 ${{ steps.get_version.outputs.version }}
+        name: 文件快传 ${{ env.VERSION }}
         body: |
-          ## 文件快传 ${{ steps.get_version.outputs.version }}
+          ## 文件快传 ${{ env.VERSION }}
           
           ### 下载
-          - [Windows 可执行文件](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/FileTransfer-${{ steps.get_version.outputs.version }}.exe)
+          - [Windows 可执行文件](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/FileTransfer-${{ env.VERSION }}.exe)
           
           ### 系统要求
           - Windows 7/8/10/11
           
           ### 更新内容
           请查看 [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)
-        files: |
-          dist/FileTransfer-${{ steps.get_version.outputs.version }}.exe
+        files: dist/FileTransfer-${{ env.VERSION }}.exe
         draft: false
         prerelease: false 

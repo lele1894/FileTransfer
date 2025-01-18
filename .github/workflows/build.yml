@@ -17,6 +17,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -55,6 +57,7 @@ jobs:
         pyinstaller --noconfirm --onefile --windowed `
           --name "FileTransfer" `
           --icon "assets/icon.ico" `
+          --add-data "assets/1024x1024.png;assets" `
           --version-file "version.txt" `
           --hidden-import win32api `
           --hidden-import win32con `
@@ -92,7 +95,10 @@ jobs:
           - Windows 7/8/10/11
           
           ### 更新内容
-          请查看 [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)
+          - 首次发布
+          - 支持局域网文件快速传输
+          - 支持文件 MD5 校验
+          - 支持进度显示和传输速度显示
         files: dist/FileTransfer-${{ env.VERSION }}.exe
         draft: false
         prerelease: false 

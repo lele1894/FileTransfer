@@ -8,6 +8,8 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPu
                             QFileDialog, QLabel, QProgressBar, QListWidget, QLineEdit,
                             QMessageBox, QTreeView, QFileSystemModel, QHeaderView)
 from PyQt5.QtCore import pyqtSignal, QObject, Qt, QTimer, QDir, QModelIndex
+from PyQt5.QtGui import QIcon
+import sys
 
 class FileTransferSignals(QObject):
     progress_updated = pyqtSignal(int)
@@ -15,6 +17,16 @@ class FileTransferSignals(QObject):
     error_occurred = pyqtSignal(str)
     remote_files_updated = pyqtSignal(list, str)
     speed_updated = pyqtSignal(str)
+
+def get_resource_path(relative_path):
+    """获取资源文件的绝对路径"""
+    if hasattr(sys, '_MEIPASS'):
+        # PyInstaller 创建临时文件夹，将路径存储在 _MEIPASS 中
+        base_path = sys._MEIPASS
+    else:
+        base_path = os.path.abspath(".")
+    
+    return os.path.join(base_path, relative_path)
 
 class FileTransferWindow(QMainWindow):
     def __init__(self, port=5000):
@@ -30,6 +42,12 @@ class FileTransferWindow(QMainWindow):
         self.current_remote_directory = ""
         self.current_local_directory = ""
         self.last_transfer_time = time.time()
+        
+        # 设置窗口图标
+        icon_path = get_resource_path(os.path.join('assets', '1024x1024.png'))
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+            
         self.setup_ui()
         self.start_server()
         

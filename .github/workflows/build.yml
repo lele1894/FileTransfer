@@ -29,10 +29,12 @@ jobs:
         # 先安装 PyQt5，避免依赖冲突
         pip install PyQt5==5.15.9
         pip install -r requirements.txt
-        # 安装打包工具
-        pip install pyinstaller==6.3.0
-        # 验证安装
-        python -c "import PyQt5; print('PyQt5 version:', PyQt5.__version__)"
+        # 安装打包工具和图标转换工具
+        pip install pyinstaller==6.3.0 pillow
+        
+    - name: Convert PNG to ICO
+      run: |
+        python -c "from PIL import Image; img = Image.open('assets/1024x1024.png'); img.save('assets/icon.ico')"
         
     - name: Get version
       id: get_version
@@ -50,6 +52,7 @@ jobs:
         # 添加所有必要的依赖
         pyinstaller --noconfirm --onefile --windowed `
           --name "FileTransfer" `
+          --icon "assets/icon.ico" `
           --version-file "version.txt" `
           --hidden-import PyQt5 `
           --hidden-import PyQt5.QtCore `

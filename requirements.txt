@@ -7,4 +7,7 @@ PyQt5-sip==12.12.2
 pywin32==305; platform_system == "Windows"
 
 # 网络和文件传输
-tqdm==4.66.2  # 用于显示进度条 
+tqdm==4.66.2  # 用于显示进度条
+
+# 图像处理
+Pillow==10.2.0  # 用于图标转换 

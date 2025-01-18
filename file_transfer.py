@@ -44,7 +44,7 @@ class FileTransferWindow(QMainWindow):
         self.last_transfer_time = time.time()
         
         # 设置窗口图标
-        icon_path = get_resource_path(os.path.join('assets', '1024x1024.png'))
+        icon_path = get_resource_path(os.path.join('assets', '1024x1024.jpeg'))
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
             

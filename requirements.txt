@@ -1,2 +1,8 @@
+# GUI 框架
 PyQt5>=5.15.0
-pywin32>=305; platform_system == "Windows" 
+
+# 系统相关
+pywin32>=305; platform_system == "Windows"
+
+# 网络和文件传输
+tqdm>=4.65.0  # 用于显示进度条 

@@ -2,6 +2,10 @@
 
 一个基于Python和PyQt5开发的局域网文件传输工具，支持Windows系统。
 
+![版本](https://img.shields.io/badge/版本-1.0.0-blue.svg)
+![许可证](https://img.shields.io/badge/许可证-MIT-green.svg)
+![Python版本](https://img.shields.io/badge/Python-3.7+-yellow.svg)
+
 ## 功能特点
 
 - 简洁的双窗格界面，方便文件浏览和传输
@@ -19,6 +23,11 @@
 
 ## 安装方法
 
+### 方式一：直接下载
+从[发布页面](https://github.com/yourusername/file-transfer/releases)下载最新版本的可执行文件。
+
+### 方式二：从源码安装
+
 1. 克隆仓库：
 ```bash
 git clone https://github.com/yourusername/file-transfer.git
@@ -33,6 +42,8 @@ pip install -r requirements.txt
 ## 使用方法
 
 1. 运行程序：
+   - 如果使用可执行文件，直接双击运行
+   - 如果使用源码：
 ```bash
 python main.py
 ```
@@ -62,6 +73,18 @@ python main.py
 - 支持文件完整性校验
 - 实时显示传输速度
 
+## 版本历史
+
+### v1.0.0 (2024-03-xx)
+- 首次发布
+- 实现基本的文件传输功能
+- 支持文件推送和拉取
+- MD5校验保证传输完整性
+
 ## 许可证
 
-MIT License 
+MIT License
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request！ 

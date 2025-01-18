@@ -7,7 +7,7 @@ import hashlib
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                             QFileDialog, QLabel, QProgressBar, QListWidget, QLineEdit,
                             QMessageBox, QTreeView, QFileSystemModel, QHeaderView)
-from PyQt5.QtCore import pyqtSignal, QObject, Qt, QTimer, QDir, QModelIndex
+from PyQt5.QtCore import pyqtSignal, QObject, Qt, QTimer, QDir, QModelIndex, QThread
 from PyQt5.QtGui import QIcon
 import sys
 
@@ -28,6 +28,113 @@ def get_resource_path(relative_path):
     
     return os.path.join(base_path, relative_path)
 
+class FileTransferThread(QThread):
+    """文件传输线程"""
+    progress_updated = pyqtSignal(int)
+    speed_updated = pyqtSignal(str)
+    completed = pyqtSignal(str)
+    error = pyqtSignal(str)
+    status_updated = pyqtSignal(str)  # 添加状态更新信号
+
+    def __init__(self, socket, file_path, save_path, is_upload=True):
+        super().__init__()
+        self.socket = socket
+        self.file_path = file_path
+        self.save_path = save_path
+        self.is_upload = is_upload
+        self.running = True
+        self._last_time = time.time()
+        self._last_update = time.time()
+        self._update_interval = 0.5
+        self._last_bytes = 0
+        self._chunk_size = 8192  # 8KB的块大小
+        self._progress_update_interval = 0.1  # 进度更新间隔
+
+    def run(self):
+        try:
+            if self.is_upload:
+                self._upload_file()
+            else:
+                self._download_file()
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _upload_file(self):
+        try:
+            file_size = os.path.getsize(self.file_path)
+            file_name = os.path.basename(self.file_path)
+            
+            self.status_updated.emit(f"正在发送: {file_name}")
+            self.status_updated.emit("计算文件MD5...")
+            md5_value = self._calculate_md5()
+
+            # 发送文件信息
+            header = f"{file_name}|{file_size}|{self.save_path}|{md5_value}<<END>>"
+            self.socket.sendall(header.encode())
+
+            # 发送文件内容
+            bytes_sent = 0
+            last_progress_update = time.time()
+            self._last_bytes = 0  # 重置字节计数
+            self._last_update = time.time()  # 重置时间
+            
+            with open(self.file_path, 'rb') as f:
+                while bytes_sent < file_size and self.running:
+                    chunk = f.read(self._chunk_size)
+                    if not chunk:
+                        break
+                        
+                    self.socket.sendall(chunk)
+                    bytes_sent += len(chunk)
+                    
+                    # 更新进度和速度
+                    current_time = time.time()
+                    if current_time - last_progress_update >= self._progress_update_interval:
+                        progress = int((bytes_sent / file_size) * 100)
+                        self.progress_updated.emit(progress)
+                        self._update_speed(bytes_sent)
+                        last_progress_update = current_time
+                        
+                    # 让出CPU时间，但不要太长
+                    QThread.yieldCurrentThread()
+
+            self.progress_updated.emit(100)
+            self._update_speed(bytes_sent)  # 最后更新一次速度
+            self.completed.emit(f"已发送: {file_name}")
+            self.status_updated.emit("传输完成")
+            
+        except Exception as e:
+            self.error.emit(f"上传失败: {str(e)}")
+            self.status_updated.emit("传输失败")
+
+    def _calculate_md5(self):
+        md5_hash = hashlib.md5()
+        with open(self.file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                md5_hash.update(chunk)
+        return md5_hash.hexdigest()
+
+    def _update_speed(self, total_bytes):
+        """计算实际每秒传输速度"""
+        current_time = time.time()
+        
+        # 检查是否达到更新间隔
+        if current_time - self._last_update >= self._update_interval:
+            # 计算这个间隔内传输的字节数
+            bytes_diff = total_bytes - self._last_bytes
+            time_diff = current_time - self._last_update
+            
+            if time_diff > 0:
+                # 计算实际每秒速度
+                speed = bytes_diff / time_diff
+                speed_mb = speed / (1024 * 1024)
+                speed_str = f"{speed_mb:.2f} MB/s"
+                self.speed_updated.emit(f"传输速度: {speed_str}")
+            
+            # 更新记录
+            self._last_bytes = total_bytes
+            self._last_update = current_time
+
 class FileTransferWindow(QMainWindow):
     def __init__(self, port=5000):
         super().__init__()
@@ -42,6 +149,10 @@ class FileTransferWindow(QMainWindow):
         self.current_remote_directory = ""
         self.current_local_directory = ""
         self.last_transfer_time = time.time()
+        self.transfer_thread = None
+        self.last_speed_update = time.time()
+        self.speed_update_interval = 0.5
+        self.last_bytes = 0  # 记录上次的字节数
         
         # 设置窗口图标
         icon_path = get_resource_path(os.path.join('assets', '1024x1024.jpeg'))
@@ -82,10 +193,6 @@ class FileTransferWindow(QMainWindow):
         self.status_label = QLabel("等待连接...")
         self.status_label.setStyleSheet("color: #666; margin: 5px;")
         status_layout.addWidget(self.status_label)
-        
-        self.transfer_status = QLabel("")
-        self.transfer_status.setStyleSheet("color: #4CAF50; font-weight: bold; margin: 5px;")
-        status_layout.addWidget(self.transfer_status)
         
         self.error_label = QLabel("")
         self.error_label.setStyleSheet("color: red; margin: 5px;")
@@ -236,16 +343,22 @@ class FileTransferWindow(QMainWindow):
         # 底部进度显示
         progress_layout = QHBoxLayout()
         
+        # 创建进度信息布局
         progress_info = QVBoxLayout()
+        
+        # 添加当前文件标签
         self.current_file_label = QLabel("当前文件: 无")
         progress_info.addWidget(self.current_file_label)
         
-        self.speed_label = QLabel("传输速度: 0 B/s")
-        self.speed_label.setStyleSheet("color: #666;")
-        progress_info.addWidget(self.speed_label)
+        # 添加传输状态标签
+        self.transfer_status = QLabel("传输速度: 0 MB/s")
+        self.transfer_status.setStyleSheet("color: #666;")
+        progress_info.addWidget(self.transfer_status)
         
+        # 添加进度信息布局到主布局
         progress_layout.addLayout(progress_info)
         
+        # 添加进度条
         self.progress_bar = QProgressBar()
         self.progress_bar.setStyleSheet("""
             QProgressBar {
@@ -260,6 +373,8 @@ class FileTransferWindow(QMainWindow):
             }
         """)
         progress_layout.addWidget(self.progress_bar)
+        
+        # 添加进度布局到主布局
         layout.addLayout(progress_layout)
         
         # 设置按钮样式
@@ -283,11 +398,11 @@ class FileTransferWindow(QMainWindow):
             button.setStyleSheet(button_style)
         
         # 连接信号
-        self.signals.progress_updated.connect(self.progress_bar.setValue)
+        self.signals.progress_updated.connect(self.update_progress)
         self.signals.transfer_completed.connect(self.on_transfer_completed)
         self.signals.error_occurred.connect(self.on_error)
         self.signals.remote_files_updated.connect(self.update_remote_files)
-        self.signals.speed_updated.connect(self.speed_label.setText)
+        self.signals.speed_updated.connect(self.update_speed_display)
         
         # 修改远程文件列表的双击事件
         self.remote_list.itemDoubleClicked.connect(self.remote_item_double_clicked)
@@ -312,12 +427,29 @@ class FileTransferWindow(QMainWindow):
         file_name = item_text.split("] ")[1].split(" (")[0]
         file_path = os.path.join(self.current_local_directory, file_name)
         
-        if os.path.isfile(file_path):
-            self.send_file(file_path)
-        else:
+        if not os.path.isfile(file_path):
             self.error_label.setText("文件不存在")
             QTimer.singleShot(3000, lambda: self.error_label.clear())
-            
+            return
+
+        # 创建并启动传输线程
+        self.transfer_thread = FileTransferThread(
+            self.client_socket, 
+            file_path, 
+            self.current_remote_directory or os.path.join(os.path.expanduser("~"), "Downloads"), 
+            is_upload=True
+        )
+        
+        # 直接连接到更新函数
+        self.transfer_thread.progress_updated.connect(self.update_progress)
+        self.transfer_thread.speed_updated.connect(self.update_speed_display)  # 直接连接
+        self.transfer_thread.completed.connect(self.on_transfer_completed)
+        self.transfer_thread.error.connect(self.on_error)
+        self.transfer_thread.status_updated.connect(self.update_status)
+        
+        # 启动线程
+        self.transfer_thread.start()
+
     def send_file(self, file_path):
         try:
             if not self.connected or not self.client_socket:
@@ -476,94 +608,128 @@ class FileTransferWindow(QMainWindow):
         while self.connected and self.client_socket:
             try:
                 data = b""
-                while b"<<END>>" not in data:
-                    chunk = self.client_socket.recv(1024)
-                    if not chunk:
-                        break
-                    data += chunk
+                # 添加超时设置
+                self.client_socket.settimeout(60)  # 60秒超时
                 
+                # 接收消息头
+                while b"<<END>>" not in data:
+                    try:
+                        chunk = self.client_socket.recv(1024)
+                        if not chunk:
+                            raise ConnectionError("连接已断开")
+                        data += chunk
+                    except socket.timeout:
+                        continue
+                    except Exception as e:
+                        raise ConnectionError(f"接收数据失败: {str(e)}")
+
                 if not data:
                     break
-                
+
+                # 处理消息
                 if b"<<END>>" in data:
                     parts = data.split(b"<<END>>", 1)
-                    message = parts[0].decode('utf-8')
+                    message = parts[0].decode('utf-8', errors='ignore')
                     remaining = parts[1] if len(parts) > 1 else b""
-                    
+
                     try:
+                        # 尝试解析为JSON消息
                         msg_data = json.loads(message)
-                        print(f"收到消息: {msg_data}")
-                        
-                        if msg_data['type'] == 'list_request':
-                            print("收到文件列表请求")
-                            path = msg_data.get('path', '')
-                            if path:
-                                self.current_local_directory = path
-                            self.send_file_list()
-                        elif msg_data['type'] == 'file_list':
-                            print(f"收到文件列表: {msg_data['files']}")
-                            self.signals.remote_files_updated.emit(msg_data['files'], msg_data.get('path', ''))
-                        elif msg_data['type'] == 'pull_request':
-                            print(f"收到文件拉取请求: {msg_data}")
-                            self.handle_pull_request(msg_data)
+                        self.handle_json_message(msg_data)
                     except json.JSONDecodeError:
-                        try:
-                            file_info = message.split('|')
-                            if len(file_info) == 4:  # 新格式：文件名|文件大小|保存路径|MD5值
-                                file_name, file_size, save_path, md5_value = file_info
-                                file_size = int(file_size)
-                            else:
-                                raise Exception("无效的文件信息格式")
-                            
-                            if not save_path:
-                                save_path = os.path.join(os.path.expanduser("~"), "Downloads")
-                            
-                            print(f"保存文件到: {save_path}")
-                            self.current_file_label.setText(f"正在接收: {file_name}")
-                            
-                            os.makedirs(save_path, exist_ok=True)
-                            full_save_path = os.path.join(save_path, file_name)
-                            
-                            self.last_transfer_time = time.time()
-                            with open(full_save_path, 'wb') as f:
-                                if remaining:
-                                    f.write(remaining)
-                                    bytes_received = len(remaining)
-                                else:
-                                    bytes_received = 0
-                                
-                                while bytes_received < file_size:
-                                    chunk = self.client_socket.recv(min(8192, file_size - bytes_received))
-                                    if not chunk:
-                                        break
-                                    f.write(chunk)
-                                    bytes_received += len(chunk)
-                                    progress = int((bytes_received / file_size) * 100)
-                                    self.signals.progress_updated.emit(progress)
-                                    self.calculate_speed(bytes_received)
-                            
-                            # 验证文件MD5
-                            received_md5 = self.calculate_md5(full_save_path)
-                            if received_md5 != md5_value:
-                                raise Exception("文件校验失败，传输可能不完整")
-                            
-                            self.signals.transfer_completed.emit(f"已接收: {file_name}")
-                            self.signals.speed_updated.emit("传输速度: 0 B/s")
-                            
-                            if not self.is_server:
-                                print("文件接收完成，请求更新文件列表")
-                                QTimer.singleShot(100, self.request_file_list)
-                        except Exception as e:
-                            print(f"文件接收失败: {str(e)}")
-                            self.signals.error_occurred.emit(f"文件接收失败: {str(e)}")
-                            continue
-                            
+                        # 不是JSON消息，尝试处理为文件传输
+                        self.handle_file_transfer(message, remaining)
+
+            except ConnectionError as e:
+                print(f"连接错误: {str(e)}")
+                self.signals.error_occurred.emit(str(e))
+                break
             except Exception as e:
                 print(f"接收错误: {str(e)}")
                 self.signals.error_occurred.emit(str(e))
                 break
-                
+
         self.disconnect_peer()
+
+    def handle_json_message(self, msg_data):
+        """处理JSON格式的消息"""
+        try:
+            if msg_data['type'] == 'list_request':
+                print("收到文件列表请求")
+                path = msg_data.get('path', '')
+                if path:
+                    self.current_local_directory = path
+                self.send_file_list()
+            elif msg_data['type'] == 'file_list':
+                print(f"收到文件列表: {msg_data['files']}")
+                self.signals.remote_files_updated.emit(msg_data['files'], msg_data.get('path', ''))
+            elif msg_data['type'] == 'pull_request':
+                print(f"收到文件拉取请求: {msg_data}")
+                self.handle_pull_request(msg_data)
+        except Exception as e:
+            print(f"处理JSON消息失败: {str(e)}")
+            raise
+
+    def handle_file_transfer(self, message, remaining):
+        """处理文件传输消息"""
+        try:
+            # 解析文件信息
+            file_info = message.split('|')
+            if len(file_info) != 4:  # 文件名|文件大小|保存路径|MD5值
+                raise ValueError("无效的文件信息格式")
+
+            file_name, file_size, save_path, md5_value = file_info
+            file_size = int(file_size)
+
+            # 设置保存路径
+            if not save_path:
+                save_path = os.path.join(os.path.expanduser("~"), "Downloads")
+
+            print(f"保存文件到: {save_path}")
+            self.current_file_label.setText(f"正在接收: {file_name}")
+
+            # 创建保存目录
+            os.makedirs(save_path, exist_ok=True)
+            full_save_path = os.path.join(save_path, file_name)
+
+            # 接收文件内容
+            self.last_transfer_time = time.time()
+            with open(full_save_path, 'wb') as f:
+                bytes_received = 0
+                if remaining:
+                    f.write(remaining)
+                    bytes_received = len(remaining)
+
+                while bytes_received < file_size:
+                    try:
+                        chunk = self.client_socket.recv(min(8192, file_size - bytes_received))
+                        if not chunk:
+                            raise ConnectionError("连接已断开")
+                        f.write(chunk)
+                        bytes_received += len(chunk)
+                        progress = int((bytes_received / file_size) * 100)
+                        self.signals.progress_updated.emit(progress)
+                        self.calculate_speed(bytes_received)
+                    except socket.timeout:
+                        continue
+
+            # 验证文件MD5
+            received_md5 = self.calculate_md5(full_save_path)
+            if received_md5 != md5_value:
+                raise ValueError("文件校验失败，传输可能不完整")
+
+            self.signals.transfer_completed.emit(f"已接收: {file_name}")
+            self.signals.speed_updated.emit("传输速度: 0 B/s")
+
+            # 更新文件列表
+            if not self.is_server:
+                print("文件接收完成，请求更新文件列表")
+                QTimer.singleShot(100, self.request_file_list)
+
+        except Exception as e:
+            print(f"文件接收失败: {str(e)}")
+            self.signals.error_occurred.emit(f"文件接收失败: {str(e)}")
+            raise
 
     def get_local_ip(self):
         try:
@@ -630,11 +796,19 @@ class FileTransferWindow(QMainWindow):
             self.client_socket = None
             
     def disconnect_peer(self):
+        if self.transfer_thread and self.transfer_thread.isRunning():
+            self.transfer_thread.running = False
+            self.transfer_thread.wait()
+            
         self.connected = False
         if self.client_socket:
-            self.client_socket.close()
+            try:
+                self.client_socket.shutdown(socket.SHUT_RDWR)
+                self.client_socket.close()
+            except:
+                pass
             self.client_socket = None
-            
+
         self.status_label.setText("等待连接...")
         self.connect_button.setText("连接")
         self.ip_input.setEnabled(True)
@@ -863,58 +1037,70 @@ class FileTransferWindow(QMainWindow):
         try:
             file_name = msg_data['file_name']
             path = msg_data.get('path', '')
-            save_path = msg_data.get('save_path', '')  # 获取保存路径
-            
+            save_path = msg_data.get('save_path', '')
+
             if not path:
                 raise Exception("无效的文件路径")
-                
+
             file_path = os.path.join(path, file_name)
             if not os.path.isfile(file_path):
                 raise Exception("文件不存在")
-                
-            # 发送文件，包含保存路径
-            file_size = os.path.getsize(file_path)
+
+            # 创建并启动传输线程
+            self.transfer_thread = FileTransferThread(
+                self.client_socket, 
+                file_path, 
+                save_path, 
+                is_upload=True
+            )
             
-            # 发送文件信息（包含保存路径）
-            header = f"{file_name}|{file_size}|{save_path}<<END>>".encode()
-            self.client_socket.send(header)
+            # 连接信号
+            self.transfer_thread.progress_updated.connect(self.update_progress)
+            self.transfer_thread.speed_updated.connect(self.update_speed_display)
+            self.transfer_thread.completed.connect(self.on_transfer_completed)
+            self.transfer_thread.error.connect(self.on_error)
+            self.transfer_thread.status_updated.connect(self.update_status)
             
-            # 发送文件内容
-            with open(file_path, 'rb') as f:
-                bytes_sent = 0
-                while bytes_sent < file_size:
-                    chunk = f.read(8192)
-                    if not chunk:
-                        break
-                    self.client_socket.send(chunk)
-                    bytes_sent += len(chunk)
-                    progress = int((bytes_sent / file_size) * 100)
-                    self.signals.progress_updated.emit(progress)
-                    
-            self.signals.transfer_completed.emit(f"已发送: {file_name}")
-            
+            # 启动线程
+            self.transfer_thread.start()
+
         except Exception as e:
             print(f"处理拉取请求失败: {str(e)}")
             self.error_label.setText(f"处理拉取请求失败: {str(e)}")
-            QTimer.singleShot(3000, lambda: self.error_label.clear()) 
+            QTimer.singleShot(3000, lambda: self.error_label.clear())
 
-    def calculate_speed(self, bytes_transferred):
-        """计算传输速度"""
+    def update_status(self, status):
+        """更新状态显示"""
+        self.current_file_label.setText(status)
+
+    def update_progress(self, value):
+        """更新进度条"""
+        self.progress_bar.setValue(value)
+
+    def update_speed_display(self, speed):
+        """更新速度显示"""
+        self.transfer_status.setText(speed)
+
+    def calculate_speed(self, total_bytes):
+        """计算实际每秒传输速度"""
         current_time = time.time()
-        time_diff = current_time - self.last_transfer_time
-        if time_diff > 0:
-            speed = bytes_transferred / time_diff
-            self.last_transfer_time = current_time
+        
+        # 检查是否达到更新间隔
+        if current_time - self.last_speed_update >= self.speed_update_interval:
+            # 计算这个间隔内传输的字节数
+            bytes_diff = total_bytes - self.last_bytes
+            time_diff = current_time - self.last_speed_update
             
-            # 格式化速度显示
-            if speed < 1024:
-                speed_str = f"{speed:.1f} B/s"
-            elif speed < 1024 * 1024:
-                speed_str = f"{speed/1024:.1f} KB/s"
-            else:
-                speed_str = f"{speed/1024/1024:.1f} MB/s"
-                
-            self.signals.speed_updated.emit(f"传输速度: {speed_str}")
+            if time_diff > 0:
+                # 计算实际每秒速度
+                speed = bytes_diff / time_diff
+                speed_mb = speed / (1024 * 1024)
+                speed_str = f"{speed_mb:.2f} MB/s"
+                self.signals.speed_updated.emit(f"传输速度: {speed_str}")
+            
+            # 更新记录
+            self.last_bytes = total_bytes
+            self.last_speed_update = current_time
 
     def calculate_md5(self, file_path):
         """计算文件MD5值"""
@@ -971,91 +1157,45 @@ class FileTransferWindow(QMainWindow):
         while self.connected and self.client_socket:
             try:
                 data = b""
-                while b"<<END>>" not in data:
-                    chunk = self.client_socket.recv(1024)
-                    if not chunk:
-                        break
-                    data += chunk
+                # 添加超时设置
+                self.client_socket.settimeout(60)  # 60秒超时
                 
+                # 接收消息头
+                while b"<<END>>" not in data:
+                    try:
+                        chunk = self.client_socket.recv(1024)
+                        if not chunk:
+                            raise ConnectionError("连接已断开")
+                        data += chunk
+                    except socket.timeout:
+                        continue
+                    except Exception as e:
+                        raise ConnectionError(f"接收数据失败: {str(e)}")
+
                 if not data:
                     break
-                
+
+                # 处理消息
                 if b"<<END>>" in data:
                     parts = data.split(b"<<END>>", 1)
-                    message = parts[0].decode('utf-8')
+                    message = parts[0].decode('utf-8', errors='ignore')
                     remaining = parts[1] if len(parts) > 1 else b""
-                    
+
                     try:
+                        # 尝试解析为JSON消息
                         msg_data = json.loads(message)
-                        print(f"收到消息: {msg_data}")
-                        
-                        if msg_data['type'] == 'list_request':
-                            print("收到文件列表请求")
-                            path = msg_data.get('path', '')
-                            if path:
-                                self.current_local_directory = path
-                            self.send_file_list()
-                        elif msg_data['type'] == 'file_list':
-                            print(f"收到文件列表: {msg_data['files']}")
-                            self.signals.remote_files_updated.emit(msg_data['files'], msg_data.get('path', ''))
-                        elif msg_data['type'] == 'pull_request':
-                            print(f"收到文件拉取请求: {msg_data}")
-                            self.handle_pull_request(msg_data)
+                        self.handle_json_message(msg_data)
                     except json.JSONDecodeError:
-                        try:
-                            file_info = message.split('|')
-                            if len(file_info) == 4:  # 新格式：文件名|文件大小|保存路径|MD5值
-                                file_name, file_size, save_path, md5_value = file_info
-                                file_size = int(file_size)
-                            else:
-                                raise Exception("无效的文件信息格式")
-                            
-                            if not save_path:
-                                save_path = os.path.join(os.path.expanduser("~"), "Downloads")
-                            
-                            print(f"保存文件到: {save_path}")
-                            self.current_file_label.setText(f"正在接收: {file_name}")
-                            
-                            os.makedirs(save_path, exist_ok=True)
-                            full_save_path = os.path.join(save_path, file_name)
-                            
-                            self.last_transfer_time = time.time()
-                            with open(full_save_path, 'wb') as f:
-                                if remaining:
-                                    f.write(remaining)
-                                    bytes_received = len(remaining)
-                                else:
-                                    bytes_received = 0
-                                
-                                while bytes_received < file_size:
-                                    chunk = self.client_socket.recv(min(8192, file_size - bytes_received))
-                                    if not chunk:
-                                        break
-                                    f.write(chunk)
-                                    bytes_received += len(chunk)
-                                    progress = int((bytes_received / file_size) * 100)
-                                    self.signals.progress_updated.emit(progress)
-                                    self.calculate_speed(bytes_received)
-                            
-                            # 验证文件MD5
-                            received_md5 = self.calculate_md5(full_save_path)
-                            if received_md5 != md5_value:
-                                raise Exception("文件校验失败，传输可能不完整")
-                            
-                            self.signals.transfer_completed.emit(f"已接收: {file_name}")
-                            self.signals.speed_updated.emit("传输速度: 0 B/s")
-                            
-                            if not self.is_server:
-                                print("文件接收完成，请求更新文件列表")
-                                QTimer.singleShot(100, self.request_file_list)
-                        except Exception as e:
-                            print(f"文件接收失败: {str(e)}")
-                            self.signals.error_occurred.emit(f"文件接收失败: {str(e)}")
-                            continue
-                            
+                        # 不是JSON消息，尝试处理为文件传输
+                        self.handle_file_transfer(message, remaining)
+
+            except ConnectionError as e:
+                print(f"连接错误: {str(e)}")
+                self.signals.error_occurred.emit(str(e))
+                break
             except Exception as e:
                 print(f"接收错误: {str(e)}")
                 self.signals.error_occurred.emit(str(e))
                 break
-                
+
         self.disconnect_peer() 

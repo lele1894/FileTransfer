@@ -6,7 +6,7 @@ import time
 import hashlib
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                             QFileDialog, QLabel, QProgressBar, QListWidget, QLineEdit,
-                            QMessageBox, QTreeView, QFileSystemModel, QHeaderView)
+                            QMessageBox, QTreeView, QFileSystemModel, QHeaderView, QComboBox)
 from PyQt5.QtCore import pyqtSignal, QObject, Qt, QTimer, QDir, QModelIndex, QThread
 from PyQt5.QtGui import QIcon
 import sys
@@ -154,6 +154,11 @@ class FileTransferWindow(QMainWindow):
         self.speed_update_interval = 0.5
         self.last_bytes = 0  # 记录上次的字节数
         
+        # 修改 IP 历史记录为 QComboBox
+        self.ip_combo = None  # 将在 setup_ui 中初始化
+        self.ip_history = []
+        self.load_ip_history()
+        
         # 设置窗口图标
         icon_path = get_resource_path(os.path.join('assets', '1024x1024.jpeg'))
         if os.path.exists(icon_path):
@@ -178,10 +183,19 @@ class FileTransferWindow(QMainWindow):
         
         top_layout.addStretch()
         
-        self.ip_input = QLineEdit()
-        self.ip_input.setPlaceholderText("输入对方IP地址")
-        self.ip_input.setMinimumWidth(200)
-        top_layout.addWidget(self.ip_input)
+        # 替换 QLineEdit 为 QComboBox
+        self.ip_combo = QComboBox()
+        self.ip_combo.setEditable(True)
+        self.ip_combo.setMinimumWidth(200)
+        self.ip_combo.lineEdit().setPlaceholderText("输入对方IP地址")
+        # 添加历史记录
+        for ip in self.ip_history:
+            self.ip_combo.addItem(ip)
+        if self.ip_history:
+            self.ip_combo.setCurrentText(self.ip_history[-1])
+        # 设置回车键响应
+        self.ip_combo.lineEdit().returnPressed.connect(self.connect_to_peer)
+        top_layout.addWidget(self.ip_combo)
         
         self.connect_button = QPushButton("连接")
         self.connect_button.clicked.connect(self.connect_to_peer)
@@ -208,8 +222,17 @@ class FileTransferWindow(QMainWindow):
         left_label.setStyleSheet("font-weight: bold; font-size: 14px; padding: 5px;")
         left_group.addWidget(left_label)
 
-        # 添加本地路径导航栏
+        # 修改本地导航栏布局
         local_nav_layout = QHBoxLayout()
+        
+        # 添加驱动器选择下拉框
+        self.local_drive_combo = QComboBox()
+        self.local_drive_combo.setMinimumWidth(80)
+        self.local_drive_combo.setMaximumWidth(100)
+        self.update_drive_list(self.local_drive_combo)
+        self.local_drive_combo.currentTextChanged.connect(self.on_local_drive_changed)
+        local_nav_layout.addWidget(self.local_drive_combo)
+        
         self.local_back_btn = QPushButton("返回上级")
         self.local_back_btn.clicked.connect(self.local_go_to_parent_directory)
         self.local_back_btn.setStyleSheet("""
@@ -277,8 +300,16 @@ class FileTransferWindow(QMainWindow):
         right_label.setStyleSheet("font-weight: bold; font-size: 14px; padding: 5px;")
         right_group.addWidget(right_label)
 
-        # 添加路径导航栏
+        # 修改远程导航栏布局
         nav_layout = QHBoxLayout()
+        
+        # 添加远程驱动器选择下拉框
+        self.remote_drive_combo = QComboBox()
+        self.remote_drive_combo.setMinimumWidth(80)
+        self.remote_drive_combo.setMaximumWidth(100)
+        self.remote_drive_combo.currentTextChanged.connect(self.on_remote_drive_changed)
+        nav_layout.addWidget(self.remote_drive_combo)
+        
         self.back_btn = QPushButton("返回上级")
         self.back_btn.clicked.connect(self.go_to_parent_directory)
         self.back_btn.setStyleSheet("""
@@ -523,37 +554,65 @@ class FileTransferWindow(QMainWindow):
             files = []
             current_path = self.current_local_directory
             
-            # 如果没有选择路径或路径无效，显示所有驱动器
-            if not current_path or not os.path.exists(current_path):
-                for drive in drives:
-                    files.append(f"[驱动器] {drive}")
-                print(f"发送驱动器列表: {files}")
-            else:
-                # 显示当前目录的内容
-                try:
-                    for item in os.listdir(current_path):
-                        item_path = os.path.join(current_path, item)
-                        try:
-                            if os.path.isfile(item_path):
-                                size = os.path.getsize(item_path)
-                                size_str = self.format_size(size)
-                                files.append(f"[文件] {item} ({size_str})")
-                            else:
-                                files.append(f"[文件夹] {item}")
-                        except Exception as e:
-                            print(f"处理文件 {item} 时出错: {str(e)}")
-                            continue
-                except Exception as e:
-                    print(f"读取目录 {current_path} 失败: {str(e)}")
-                    # 如果读取失败，返回到驱动器列表
+            # 如果是驱动器根目录（如 D:\）或空路径，显示驱动器列表
+            if os.name == 'nt':
+                if not current_path or current_path == "":
+                    # 显示驱动器列表
                     for drive in drives:
                         files.append(f"[驱动器] {drive}")
+                    print(f"发送驱动器列表: {files}")
+                    current_path = ""  # 重置为空字符串表示根目录
+                else:
+                    # 显示当前目录的内容
+                    try:
+                        for item in os.listdir(current_path):
+                            item_path = os.path.join(current_path, item)
+                            try:
+                                if os.path.isfile(item_path):
+                                    size = os.path.getsize(item_path)
+                                    size_str = self.format_size(size)
+                                    files.append(f"[文件] {item} ({size_str})")
+                                else:
+                                    files.append(f"[文件夹] {item}")
+                            except Exception as e:
+                                print(f"处理文件 {item} 时出错: {str(e)}")
+                                continue
+                    except Exception as e:
+                        print(f"读取目录 {current_path} 失败: {str(e)}")
+                        # 如果读取失败，返回到驱动器列表
+                        for drive in drives:
+                            files.append(f"[驱动器] {drive}")
+                        current_path = ""
+            else:
+                # Linux/Mac 系统的处理逻辑
+                if not current_path or current_path == "/":
+                    files.append("[驱动器] /")
+                    current_path = "/"
+                else:
+                    # 显示当前目录的内容
+                    try:
+                        for item in os.listdir(current_path):
+                            item_path = os.path.join(current_path, item)
+                            try:
+                                if os.path.isfile(item_path):
+                                    size = os.path.getsize(item_path)
+                                    size_str = self.format_size(size)
+                                    files.append(f"[文件] {item} ({size_str})")
+                                else:
+                                    files.append(f"[文件夹] {item}")
+                            except Exception as e:
+                                print(f"处理文件 {item} 时出错: {str(e)}")
+                                continue
+                    except Exception as e:
+                        print(f"读取目录 {current_path} 失败: {str(e)}")
+                        files.append("[驱动器] /")
+                        current_path = "/"
             
-            print(f"准备发送文件列表: {files}")
+            print(f"准备发送文件列表: {files}, 当前路径: {current_path}")
             response = {
                 'type': 'file_list',
                 'files': files,
-                'path': current_path if current_path and os.path.exists(current_path) else ''
+                'path': current_path
             }
             message = json.dumps(response) + "<<END>>"
             self.client_socket.send(message.encode())
@@ -580,13 +639,32 @@ class FileTransferWindow(QMainWindow):
             # 更新当前路径显示
             if current_path:
                 self.current_remote_path.setText(f"当前位置: {current_path}")
+                # 更新驱动器下拉框
+                if os.name == 'nt':
+                    drive = os.path.splitdrive(current_path)[0]
+                    if drive:
+                        index = self.remote_drive_combo.findText(drive)
+                        if index >= 0:
+                            self.remote_drive_combo.setCurrentIndex(index)
+                else:
+                    self.remote_drive_combo.clear()
+                    for file in files:
+                        if file.startswith("[驱动器]"):
+                            drive = file.split("] ")[1].strip().rstrip('\\')
+                            self.remote_drive_combo.addItem(drive)
             else:
                 self.current_remote_path.setText("当前位置: 根目录")
+                # 更新远程驱动器列表
+                self.remote_drive_combo.clear()
+                for file in files:
+                    if file.startswith("[驱动器]"):
+                        drive = file.split("] ")[1].strip().rstrip('\\')
+                        self.remote_drive_combo.addItem(drive)
             
             for file in files:
                 item = file.strip()
                 self.remote_list.addItem(item)
-            print(f"更新远程文件列表: {files}, 当前路径: {current_path}")
+            
         except Exception as e:
             print(f"更新远程文件列表失败: {str(e)}")
             self.error_label.setText(f"更新远程文件列表失败: {str(e)}")
@@ -772,29 +850,58 @@ class FileTransferWindow(QMainWindow):
             return
             
         try:
-            ip = self.ip_input.text()
+            ip = self.ip_combo.currentText().strip()
             if not ip:
                 self.error_label.setText("请输入对方IP地址")
                 QTimer.singleShot(3000, lambda: self.error_label.clear())
                 return
+            
+            # 保存IP到历史记录
+            if ip not in self.ip_history:
+                self.ip_history.append(ip)
+                if len(self.ip_history) > 10:  # 最多保存10条记录
+                    self.ip_history.pop(0)
+                self.save_ip_history()
+                # 更新下拉列表
+                self.ip_combo.clear()
+                for hist_ip in self.ip_history:
+                    self.ip_combo.addItem(hist_ip)
                 
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client_socket.connect((ip, self.port))
             self.connected = True
-            self.is_server = False  # 设置为被控端
+            self.is_server = False
             self.status_label.setText(f"已连接到: {ip}")
             self.connect_button.setText("断开连接")
-            self.ip_input.setEnabled(False)
+            self.ip_combo.setEnabled(False)
             
             threading.Thread(target=self.receive_files, daemon=True).start()
-            
-            # 连接成功后延迟500ms再请求文件列表，确保接收线程已经启动
             QTimer.singleShot(500, self.request_file_list)
             
         except Exception as e:
             self.signals.error_occurred.emit(str(e))
             self.client_socket = None
-            
+
+    def load_ip_history(self):
+        """加载IP历史记录"""
+        try:
+            history_file = os.path.join(os.path.expanduser("~"), ".file_transfer_history")
+            if os.path.exists(history_file):
+                with open(history_file, "r", encoding="utf-8") as f:
+                    self.ip_history = [line.strip() for line in f.readlines() if line.strip()]
+        except Exception as e:
+            print(f"加载IP历史记录失败: {str(e)}")
+
+    def save_ip_history(self):
+        """保存IP历史记录"""
+        try:
+            history_file = os.path.join(os.path.expanduser("~"), ".file_transfer_history")
+            with open(history_file, "w", encoding="utf-8") as f:
+                for ip in self.ip_history:
+                    f.write(f"{ip}\n")
+        except Exception as e:
+            print(f"保存IP历史记录失败: {str(e)}")
+
     def disconnect_peer(self):
         if self.transfer_thread and self.transfer_thread.isRunning():
             self.transfer_thread.running = False
@@ -811,7 +918,7 @@ class FileTransferWindow(QMainWindow):
 
         self.status_label.setText("等待连接...")
         self.connect_button.setText("连接")
-        self.ip_input.setEnabled(True)
+        self.ip_combo.setEnabled(True)
         self.progress_bar.setValue(0)
         self.current_file_label.setText("当前文件: 无")
         self.transfer_status.clear()
@@ -846,6 +953,8 @@ class FileTransferWindow(QMainWindow):
         self.disconnect_peer()
         
     def closeEvent(self, event):
+        """关闭窗口时保存IP历史记录"""
+        self.save_ip_history()
         if self.client_socket:
             self.client_socket.close()
         if hasattr(self, 'server_socket'):
@@ -871,9 +980,12 @@ class FileTransferWindow(QMainWindow):
         try:
             text = item.text()
             if text.startswith("[驱动器]"):
-                # 提取驱动器路径
+                # 提取驱动器路径，保留完整路径（如 "C:\"）
                 path = text.split("] ")[1].strip()
+                if os.name == 'nt' and not path.endswith('\\'): 
+                    path = path + '\\'  # 确保Windows驱动器路径以反斜杠结尾
                 print(f"请求打开驱动器: {path}")
+                self.current_remote_directory = path  # 设置当前远程目录
             elif text.startswith("[文件夹]"):
                 # 如果是文件夹，拼接完整路径
                 folder_name = text.split("] ")[1].strip()
@@ -897,27 +1009,44 @@ class FileTransferWindow(QMainWindow):
             self.error_label.setText(f"打开文件夹失败: {str(e)}")
 
     def go_to_parent_directory(self):
-        """返回上级目录"""
-        if not self.current_remote_directory or self.current_remote_directory == "":
-            return
-            
-        parent_path = os.path.dirname(self.current_remote_directory)
-        print(f"返回上级目录: {parent_path}")
-        
-        # 如果已经是驱动器根目录，则返回驱动器列表
-        if len(parent_path) <= 3:  # 例如 "C:\"
-            parent_path = ""
-            
-        request = {
-            'type': 'list_request',
-            'path': parent_path
-        }
-        message = json.dumps(request) + "<<END>>"
+        """返回远程上级目录"""
         try:
-            self.client_socket.send(message.encode())
+            if not self.current_remote_directory:
+                return
+            
+            if os.name == 'nt':  # Windows 系统
+                drive, path = os.path.splitdrive(self.current_remote_directory)
+                # 如果当前是驱动器根目录（如 C:\），返回驱动器列表
+                if path in ['\\', '/', '']:
+                    parent_path = ""  # 返回驱动器列表
+                else:
+                    parent_path = os.path.dirname(self.current_remote_directory)
+                    # 如果返回到驱动器根目录，确保路径格式正确
+                    if parent_path == drive:
+                        parent_path = drive + '\\'
+            else:  # Linux/Mac 系统
+                if self.current_remote_directory == '/':
+                    return
+                parent_path = os.path.dirname(self.current_remote_directory)
+                if not parent_path:  # 如果是根目录
+                    parent_path = '/'
+            
+            print(f"返回上级目录: 当前={self.current_remote_directory}, 父级={parent_path}")
+            request = {
+                'type': 'list_request',
+                'path': parent_path
+            }
+            message = json.dumps(request) + "<<END>>"
+            try:
+                self.client_socket.send(message.encode())
+            except Exception as e:
+                print(f"返回上级目录失败: {str(e)}")
+                self.error_label.setText(f"返回上级目录失败: {str(e)}")
+                QTimer.singleShot(3000, lambda: self.error_label.clear())
         except Exception as e:
-            print(f"返回上级目录失败: {str(e)}")
-            self.error_label.setText(f"返回上级目录失败: {str(e)}") 
+            print(f"返回上级目录操作失败: {str(e)}")
+            self.error_label.setText(f"返回上级目录操作失败: {str(e)}")
+            QTimer.singleShot(3000, lambda: self.error_label.clear())
 
     def update_local_files(self, path=""):
         """更新本地文件列表显示"""
@@ -980,17 +1109,24 @@ class FileTransferWindow(QMainWindow):
 
     def local_go_to_parent_directory(self):
         """返回本地上级目录"""
-        if not self.current_local_directory or self.current_local_directory == "":
+        if not self.current_local_directory:
             return
             
-        parent_path = os.path.dirname(self.current_local_directory)
-        print(f"返回本地上级目录: {parent_path}")
-        
-        # 如果已经是驱动器根目录，则返回驱动器列表
-        if len(parent_path) <= 3:  # 例如 "C:\"
-            parent_path = ""
-            
-        self.update_local_files(parent_path) 
+        if os.name == 'nt':  # Windows 系统
+            drive, path = os.path.splitdrive(self.current_local_directory)
+            # 如果路径只有驱动器号（如 C:) 或者驱动器根目录（如 C:\），返回驱动器列表
+            if not path or path == '\\' or path == '/':
+                self.update_local_files("")
+            else:
+                parent_path = os.path.dirname(self.current_local_directory)
+                self.update_local_files(parent_path)
+        else:  # Linux/Mac 系统
+            if self.current_local_directory == '/':
+                return
+            parent_path = os.path.dirname(self.current_local_directory)
+            if not parent_path:  # 如果是根目录
+                parent_path = '/'
+            self.update_local_files(parent_path)
 
     def pull_selected_file(self):
         """拉取远程文件到本地"""
@@ -1198,4 +1334,78 @@ class FileTransferWindow(QMainWindow):
                 self.signals.error_occurred.emit(str(e))
                 break
 
-        self.disconnect_peer() 
+        self.disconnect_peer()
+
+    def update_drive_list(self, combo_box):
+        """更新驱动器列表"""
+        combo_box.clear()
+        if os.name == 'nt':  # Windows系统
+            import win32api
+            drives = win32api.GetLogicalDriveStrings().split('\000')[:-1]
+            for drive in drives:
+                combo_box.addItem(drive.rstrip('\\'))
+        else:  # Linux/Mac系统
+            combo_box.addItem('/')
+
+    def on_local_drive_changed(self, drive):
+        """处理本地驱动器选择变化"""
+        if drive:
+            if os.name == 'nt':
+                drive = drive + '\\'
+            self.update_local_files(drive)
+
+    def on_remote_drive_changed(self, drive):
+        """处理远程驱动器选择变化"""
+        if drive and self.connected:
+            if os.name == 'nt':
+                drive = drive + '\\'
+            request = {
+                'type': 'list_request',
+                'path': drive
+            }
+            message = json.dumps(request) + "<<END>>"
+            try:
+                self.client_socket.send(message.encode())
+            except Exception as e:
+                print(f"请求远程目录失败: {str(e)}")
+                self.error_label.setText(f"请求远程目录失败: {str(e)}")
+
+    def update_remote_files(self, files, current_path=""):
+        """更新远程文件列表显示"""
+        try:
+            self.remote_list.clear()
+            self.remote_files = files
+            self.current_remote_directory = current_path
+            
+            # 更新当前路径显示
+            if current_path:
+                self.current_remote_path.setText(f"当前位置: {current_path}")
+                # 更新驱动器下拉框
+                if os.name == 'nt':
+                    drive = os.path.splitdrive(current_path)[0]
+                    if drive:
+                        index = self.remote_drive_combo.findText(drive)
+                        if index >= 0:
+                            self.remote_drive_combo.setCurrentIndex(index)
+                else:
+                    self.remote_drive_combo.clear()
+                    for file in files:
+                        if file.startswith("[驱动器]"):
+                            drive = file.split("] ")[1].strip().rstrip('\\')
+                            self.remote_drive_combo.addItem(drive)
+            else:
+                self.current_remote_path.setText("当前位置: 根目录")
+                # 更新远程驱动器列表
+                self.remote_drive_combo.clear()
+                for file in files:
+                    if file.startswith("[驱动器]"):
+                        drive = file.split("] ")[1].strip().rstrip('\\')
+                        self.remote_drive_combo.addItem(drive)
+            
+            for file in files:
+                item = file.strip()
+                self.remote_list.addItem(item)
+            
+        except Exception as e:
+            print(f"更新远程文件列表失败: {str(e)}")
+            self.error_label.setText(f"更新远程文件列表失败: {str(e)}") 

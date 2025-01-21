@@ -8,6 +8,12 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      tag_version:
+        description: '版本号 (例如: v1.0.0)'
+        required: true
+        type: string
+        default: 'v1.0.0'
 
 jobs:
   build:
@@ -19,6 +25,11 @@ jobs:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
+    
+    - name: Create Tag
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        git tag ${{ github.event.inputs.tag_version }}
     
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -53,17 +64,18 @@ jobs:
         path: dist/FileTransfer.exe
         
     - name: Create Release
-      if: startsWith(github.ref, 'refs/tags/')
+      if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       uses: softprops/action-gh-release@v1
       with:
-        name: 文件快传 ${{ github.ref_name }}
+        name: 文件快传 ${{ github.event.inputs.tag_version || github.ref_name }}
+        tag_name: ${{ github.event.inputs.tag_version || github.ref_name }}
         body: |
-          ## 文件快传 ${{ github.ref_name }}
+          ## 文件快传 ${{ github.event.inputs.tag_version || github.ref_name }}
           
           ### 下载
-          - [Windows 可执行文件](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/FileTransfer.exe)
+          - [Windows 可执行文件](https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.tag_version || github.ref_name }}/FileTransfer.exe)
           
           ### 系统要求
           - Windows 7/8/10/11

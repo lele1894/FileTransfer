@@ -4,19 +4,35 @@ import threading
 import json
 import time
 import hashlib
-from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-                            QFileDialog, QLabel, QProgressBar, QListWidget, QLineEdit,
-                            QMessageBox, QTreeView, QFileSystemModel, QHeaderView, QComboBox)
-from PyQt5.QtCore import pyqtSignal, QObject, Qt, QTimer, QDir, QModelIndex, QThread
-from PyQt5.QtGui import QIcon
+import customtkinter as ctk
+from tkinter import ttk
 import sys
+from PIL import Image
+import io
+import re
 
-class FileTransferSignals(QObject):
-    progress_updated = pyqtSignal(int)
-    transfer_completed = pyqtSignal(str)
-    error_occurred = pyqtSignal(str)
-    remote_files_updated = pyqtSignal(list, str)
-    speed_updated = pyqtSignal(str)
+class FileTransferSignals:
+    """自定义信号类"""
+    def __init__(self):
+        self._callbacks = {
+            'progress_updated': [],
+            'transfer_completed': [],
+            'error_occurred': [],
+            'remote_files_updated': [],
+            'speed_updated': [],
+            'status_updated': []  # 添加状态更新信号
+        }
+    
+    def connect(self, signal, callback):
+        """连接信号到回调函数"""
+        if signal in self._callbacks:
+            self._callbacks[signal].append(callback)
+    
+    def emit(self, signal, *args):
+        """发送信号"""
+        if signal in self._callbacks:
+            for callback in self._callbacks[signal]:
+                callback(*args)
 
 def get_resource_path(relative_path):
     """获取资源文件的绝对路径"""
@@ -28,27 +44,22 @@ def get_resource_path(relative_path):
     
     return os.path.join(base_path, relative_path)
 
-class FileTransferThread(QThread):
+class FileTransferThread(threading.Thread):
     """文件传输线程"""
-    progress_updated = pyqtSignal(int)
-    speed_updated = pyqtSignal(str)
-    completed = pyqtSignal(str)
-    error = pyqtSignal(str)
-    status_updated = pyqtSignal(str)  # 添加状态更新信号
-
-    def __init__(self, socket, file_path, save_path, is_upload=True):
+    def __init__(self, socket, file_path, save_path, is_upload=True, signals=None):
         super().__init__()
         self.socket = socket
         self.file_path = file_path
         self.save_path = save_path
         self.is_upload = is_upload
         self.running = True
+        self.signals = signals or FileTransferSignals()
         self._last_time = time.time()
         self._last_update = time.time()
         self._update_interval = 0.5
         self._last_bytes = 0
-        self._chunk_size = 8192  # 8KB的块大小
-        self._progress_update_interval = 0.1  # 进度更新间隔
+        self._chunk_size = 262144  # 增加到256KB的块大小
+        self._progress_update_interval = 0.2  # 降低进度更新频率
 
     def run(self):
         try:
@@ -57,26 +68,30 @@ class FileTransferThread(QThread):
             else:
                 self._download_file()
         except Exception as e:
-            self.error.emit(str(e))
+            self.signals.emit('error_occurred', str(e))
 
     def _upload_file(self):
         try:
             file_size = os.path.getsize(self.file_path)
             file_name = os.path.basename(self.file_path)
             
-            self.status_updated.emit(f"正在发送: {file_name}")
-            self.status_updated.emit("计算文件MD5...")
+            self.signals.emit('status_updated', f"正在发送: {file_name}")
+            self.signals.emit('status_updated', "计算文件MD5...")
             md5_value = self._calculate_md5()
 
             # 发送文件信息
             header = f"{file_name}|{file_size}|{self.save_path}|{md5_value}<<END>>"
             self.socket.sendall(header.encode())
 
+            # 优化socket配置
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 524288)  # 512KB发送缓冲区
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # 禁用Nagle算法
+            
             # 发送文件内容
             bytes_sent = 0
             last_progress_update = time.time()
-            self._last_bytes = 0  # 重置字节计数
-            self._last_update = time.time()  # 重置时间
+            self._last_bytes = 0
+            self._last_update = time.time()
             
             with open(self.file_path, 'rb') as f:
                 while bytes_sent < file_size and self.running:
@@ -87,25 +102,25 @@ class FileTransferThread(QThread):
                     self.socket.sendall(chunk)
                     bytes_sent += len(chunk)
                     
-                    # 更新进度和速度
+                    # 降低进度更新频率
                     current_time = time.time()
                     if current_time - last_progress_update >= self._progress_update_interval:
                         progress = int((bytes_sent / file_size) * 100)
-                        self.progress_updated.emit(progress)
+                        self.signals.emit('progress_updated', progress)
                         self._update_speed(bytes_sent)
                         last_progress_update = current_time
-                        
-                    # 让出CPU时间，但不要太长
-                    QThread.yieldCurrentThread()
 
-            self.progress_updated.emit(100)
-            self._update_speed(bytes_sent)  # 最后更新一次速度
-            self.completed.emit(f"已发送: {file_name}")
-            self.status_updated.emit("传输完成")
+            if bytes_sent == file_size:
+                self.signals.emit('progress_updated', 100)
+                self._update_speed(bytes_sent)
+                self.signals.emit('transfer_completed', f"已发送: {file_name}")
+                self.signals.emit('status_updated', "传输完成")
+            else:
+                raise Exception("传输未完成")
             
         except Exception as e:
-            self.error.emit(f"上传失败: {str(e)}")
-            self.status_updated.emit("传输失败")
+            self.signals.emit('error_occurred', f"上传失败: {str(e)}")
+            self.signals.emit('status_updated', "传输失败")
 
     def _calculate_md5(self):
         md5_hash = hashlib.md5()
@@ -129,13 +144,66 @@ class FileTransferThread(QThread):
                 speed = bytes_diff / time_diff
                 speed_mb = speed / (1024 * 1024)
                 speed_str = f"{speed_mb:.2f} MB/s"
-                self.speed_updated.emit(f"传输速度: {speed_str}")
+                self.signals.emit('speed_updated', speed_str)
             
             # 更新记录
             self._last_bytes = total_bytes
             self._last_update = current_time
 
-class FileTransferWindow(QMainWindow):
+    def _download_file(self):
+        """处理文件下载"""
+        try:
+            if not os.path.exists(self.file_path):
+                raise Exception("文件不存在")
+            
+            file_size = os.path.getsize(self.file_path)
+            file_name = os.path.basename(self.file_path)
+            
+            self.signals.emit('status_updated', f"正在下载: {file_name}")
+            
+            # 创建保存目录
+            os.makedirs(self.save_path, exist_ok=True)
+            save_file_path = os.path.join(self.save_path, file_name)
+            
+            # 优化socket配置
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 524288)
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            
+            with open(save_file_path, 'wb', buffering=262144) as f:
+                bytes_received = 0
+                last_progress_update = time.time()
+                self._last_bytes = 0
+                self._last_update = time.time()
+                
+                while bytes_received < file_size and self.running:
+                    chunk = self.socket.recv(min(262144, file_size - bytes_received))
+                    if not chunk:
+                        break
+                    
+                    f.write(chunk)
+                    bytes_received += len(chunk)
+                    
+                    # 更新进度
+                    current_time = time.time()
+                    if current_time - last_progress_update >= self._progress_update_interval:
+                        progress = int((bytes_received / file_size) * 100)
+                        self.signals.emit('progress_updated', progress)
+                        self._update_speed(bytes_received)
+                        last_progress_update = current_time
+                
+                if bytes_received == file_size:
+                    self.signals.emit('progress_updated', 100)
+                    self._update_speed(bytes_received)
+                    self.signals.emit('transfer_completed', f"已下载: {file_name}")
+                    self.signals.emit('status_updated', "下载完成")
+                else:
+                    raise Exception("下载未完成")
+                
+        except Exception as e:
+            self.signals.emit('error_occurred', f"下载失败: {str(e)}")
+            self.signals.emit('status_updated', "下载失败")
+
+class FileTransferWindow(ctk.CTk):
     def __init__(self, port=5000):
         super().__init__()
         self.port = port
@@ -146,340 +214,326 @@ class FileTransferWindow(QMainWindow):
         self.save_dir = os.path.join(os.path.expanduser("~"), "Downloads")
         self.remote_files = []
         self.buffer = ""
-        self.current_remote_directory = ""
-        self.current_local_directory = ""
+        self.current_remote_directory = ""  # 初始为空，显示所有驱动器
+        self.current_local_directory = ""   # 初始为空，显示所有驱动器
         self.last_transfer_time = time.time()
         self.transfer_thread = None
         self.last_speed_update = time.time()
         self.speed_update_interval = 0.5
-        self.last_bytes = 0  # 记录上次的字节数
+        self.last_bytes = 0
         
-        # 修改 IP 历史记录为 QComboBox
-        self.ip_combo = None  # 将在 setup_ui 中初始化
+        # IP 历史记录
         self.ip_history = []
         self.load_ip_history()
         
         # 设置窗口图标
-        icon_path = get_resource_path(os.path.join('assets', '1024x1024.jpeg'))
-        if os.path.exists(icon_path):
-            self.setWindowIcon(QIcon(icon_path))
+        try:
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tb.jpeg')
+            if os.path.exists(icon_path):
+                img = Image.open(icon_path)
+                img = img.resize((32, 32), Image.Resampling.LANCZOS)
+                temp_ico = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp_icon.ico')
+                img.save(temp_ico, format='ICO', sizes=[(32, 32)])
+                self.after(100, lambda: self.iconbitmap(temp_ico))
+                self.after(1000, lambda: os.remove(temp_ico) if os.path.exists(temp_ico) else None)
+        except Exception as e:
+            print(f"设置图标失败: {str(e)}")
             
-        self.setup_ui()
-        self.start_server()
+        self.setup_ui()  # 先设置UI
         
+        # 在UI设置完成后，再进行其他初始化
+        self.after(100, self.post_init)  # 使用after延迟执行其他初始化操作
+
+    def post_init(self):
+        """UI加载完成后的初始化操作"""
+        try:
+            # 更新驱动器列表
+            self.update_drive_list(self.local_drive_combo)
+            
+            # 更新本地文件列表显示所有驱动器
+            self.update_local_files("")
+            
+            # 启动服务器
+            self.start_server()
+            
+            # 设置信号连接
+            self.setup_signals()
+        except Exception as e:
+            print(f"初始化失败: {str(e)}")
+
     def setup_ui(self):
-        self.setWindowTitle("文件快传")
-        self.setGeometry(100, 100, 1200, 700)
-        
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        layout = QVBoxLayout(central_widget)
+        self.title("文件快传")
+        self.geometry("1200x700")
         
         # 顶部连接区域
-        top_layout = QHBoxLayout()
-        self.ip_label = QLabel(f"本机IP: {self.get_local_ip()}")
-        self.ip_label.setStyleSheet("color: blue; font-weight: bold;")
-        top_layout.addWidget(self.ip_label)
+        top_frame = ctk.CTkFrame(self)
+        top_frame.pack(fill="x", padx=10, pady=5)
         
-        top_layout.addStretch()
+        self.ip_label = ctk.CTkLabel(top_frame, text=f"本机IP: {self.get_local_ip()}")
+        self.ip_label.pack(side="left")
         
-        # 替换 QLineEdit 为 QComboBox
-        self.ip_combo = QComboBox()
-        self.ip_combo.setEditable(True)
-        self.ip_combo.setMinimumWidth(200)
-        self.ip_combo.lineEdit().setPlaceholderText("输入对方IP地址")
-        # 添加历史记录
-        for ip in self.ip_history:
-            self.ip_combo.addItem(ip)
-        if self.ip_history:
-            self.ip_combo.setCurrentText(self.ip_history[-1])
-        # 设置回车键响应
-        self.ip_combo.lineEdit().returnPressed.connect(self.connect_to_peer)
-        top_layout.addWidget(self.ip_combo)
+        # IP输入下拉框
+        self.ip_combo = ctk.CTkComboBox(top_frame, width=200)
+        self.ip_combo.pack(side="right", padx=5)
+        self.ip_combo.set("输入对方IP地址")
+        if self.ip_history:  # 修改这里，确保有历史记录时才设置
+            self.ip_combo.configure(values=list(self.ip_history))
         
-        self.connect_button = QPushButton("连接")
-        self.connect_button.clicked.connect(self.connect_to_peer)
-        top_layout.addWidget(self.connect_button)
-        layout.addLayout(top_layout)
+        self.connect_button = ctk.CTkButton(
+            top_frame, 
+            text="连接",
+            command=self.connect_to_peer
+        )
+        self.connect_button.pack(side="right", padx=5)
         
         # 状态显示
-        status_layout = QHBoxLayout()
-        self.status_label = QLabel("等待连接...")
-        self.status_label.setStyleSheet("color: #666; margin: 5px;")
-        status_layout.addWidget(self.status_label)
+        status_frame = ctk.CTkFrame(self)
+        status_frame.pack(fill="x", padx=10, pady=5)
         
-        self.error_label = QLabel("")
-        self.error_label.setStyleSheet("color: red; margin: 5px;")
-        status_layout.addWidget(self.error_label)
-        layout.addLayout(status_layout)
+        self.status_label = ctk.CTkLabel(status_frame, text="等待连接...")
+        self.status_label.pack(side="left")
+        
+        self.error_label = ctk.CTkLabel(status_frame, text="", text_color="red")
+        self.error_label.pack(side="left", padx=10)
         
         # 文件浏览区域
-        browser_layout = QHBoxLayout()
+        browser_frame = ctk.CTkFrame(self)
+        browser_frame.pack(fill="both", expand=True, padx=10, pady=5)
         
-        # 左侧本地文件浏览器
-        left_group = QVBoxLayout()
-        left_label = QLabel("本地设备")
-        left_label.setStyleSheet("font-weight: bold; font-size: 14px; padding: 5px;")
-        left_group.addWidget(left_label)
-
-        # 修改本地导航栏布局
-        local_nav_layout = QHBoxLayout()
+        # 左侧本地文件
+        left_frame = ctk.CTkFrame(browser_frame, width=400)  # 设置固定宽度
+        left_frame.pack(side="left", fill="both", expand=True, padx=(0,5))
+        left_frame.pack_propagate(False)  # 防止子组件影响frame大小
         
-        # 添加驱动器选择下拉框
-        self.local_drive_combo = QComboBox()
-        self.local_drive_combo.setMinimumWidth(80)
-        self.local_drive_combo.setMaximumWidth(100)
-        self.update_drive_list(self.local_drive_combo)
-        self.local_drive_combo.currentTextChanged.connect(self.on_local_drive_changed)
-        local_nav_layout.addWidget(self.local_drive_combo)
+        ctk.CTkLabel(left_frame, text="本地设备").pack()
         
-        self.local_back_btn = QPushButton("返回上级")
-        self.local_back_btn.clicked.connect(self.local_go_to_parent_directory)
-        self.local_back_btn.setStyleSheet("""
-            QPushButton {
-                padding: 5px 10px;
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-        """)
-        local_nav_layout.addWidget(self.local_back_btn)
+        # 本地导航栏
+        local_nav = ctk.CTkFrame(left_frame)
+        local_nav.pack(fill="x")
         
-        self.current_local_path = QLabel("")
-        self.current_local_path.setStyleSheet("color: #666; padding: 5px;")
-        local_nav_layout.addWidget(self.current_local_path)
-        left_group.addLayout(local_nav_layout)
-
-        # 使用QListWidget替代QTreeView
-        self.local_list = QListWidget()
-        self.local_list.setStyleSheet("""
-            QListWidget {
-                border: 1px solid #ccc;
-                border-radius: 4px;
-                padding: 5px;
-            }
-            QListWidget::item {
-                padding: 5px;
-                margin: 2px;
-            }
-            QListWidget::item:selected {
-                background-color: #e6f3ff;
-                color: black;
-            }
-        """)
-        self.local_list.itemDoubleClicked.connect(self.local_item_double_clicked)
-        left_group.addWidget(self.local_list)
+        self.local_drive_combo = ctk.CTkComboBox(
+            local_nav,
+            width=100,
+            command=self.on_local_drive_changed
+        )
+        self.local_drive_combo.pack(side="left", padx=5)
         
-        # 刷新本地文件列表
-        self.update_local_files()
+        self.local_back_btn = ctk.CTkButton(
+            local_nav,
+            text="返回上级",
+            command=self.local_go_to_parent_directory
+        )
+        self.local_back_btn.pack(side="left", padx=5)
         
-        browser_layout.addLayout(left_group)
+        self.current_local_path = ctk.CTkLabel(local_nav, text="")
+        self.current_local_path.pack(side="left", padx=5)
         
-        # 中间传输按钮
-        middle_group = QVBoxLayout()
-        middle_group.addStretch()
+        # 本地文件列表
+        local_list_frame = ctk.CTkFrame(left_frame)
+        local_list_frame.pack(fill="both", expand=True)
         
-        self.transfer_btn = QPushButton("推送 →")
-        self.transfer_btn.clicked.connect(self.transfer_selected_file)
-        middle_group.addWidget(self.transfer_btn)
+        # 添加滚动条
+        local_scrollbar_y = ttk.Scrollbar(local_list_frame)
+        local_scrollbar_y.pack(side="right", fill="y")
         
-        self.pull_btn = QPushButton("← 拉取")
-        self.pull_btn.clicked.connect(self.pull_selected_file)
-        middle_group.addWidget(self.pull_btn)
+        local_scrollbar_x = ttk.Scrollbar(local_list_frame, orient="horizontal")
+        local_scrollbar_x.pack(side="bottom", fill="x")
         
-        middle_group.addStretch()
-        browser_layout.addLayout(middle_group)
+        self.local_list = ttk.Treeview(
+            local_list_frame,
+            selectmode="extended",
+            columns=("type", "name", "size"),
+            show="headings",
+            yscrollcommand=local_scrollbar_y.set,
+            xscrollcommand=local_scrollbar_x.set
+        )
+        self.local_list.heading("type", text="类型", command=lambda: self.treeview_sort_column(self.local_list, "type", False))
+        self.local_list.heading("name", text="名称", command=lambda: self.treeview_sort_column(self.local_list, "name", False))
+        self.local_list.heading("size", text="大小", command=lambda: self.treeview_sort_column(self.local_list, "size", False))
         
-        # 右侧远程文件列表
-        right_group = QVBoxLayout()
-        right_label = QLabel("远程文件")
-        right_label.setStyleSheet("font-weight: bold; font-size: 14px; padding: 5px;")
-        right_group.addWidget(right_label)
-
-        # 修改远程导航栏布局
-        nav_layout = QHBoxLayout()
+        # 设置列宽
+        self.local_list.column("type", width=80, minwidth=60)
+        self.local_list.column("name", width=200, minwidth=100)
+        self.local_list.column("size", width=100, minwidth=80)
         
-        # 添加远程驱动器选择下拉框
-        self.remote_drive_combo = QComboBox()
-        self.remote_drive_combo.setMinimumWidth(80)
-        self.remote_drive_combo.setMaximumWidth(100)
-        self.remote_drive_combo.currentTextChanged.connect(self.on_remote_drive_changed)
-        nav_layout.addWidget(self.remote_drive_combo)
+        self.local_list.pack(fill="both", expand=True)
+        self.local_list.bind("<Double-1>", self.local_item_double_clicked)
         
-        self.back_btn = QPushButton("返回上级")
-        self.back_btn.clicked.connect(self.go_to_parent_directory)
-        self.back_btn.setStyleSheet("""
-            QPushButton {
-                padding: 5px 10px;
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-        """)
-        nav_layout.addWidget(self.back_btn)
+        # 配置滚动条
+        local_scrollbar_y.config(command=self.local_list.yview)
+        local_scrollbar_x.config(command=self.local_list.xview)
         
-        self.current_remote_path = QLabel("")
-        self.current_remote_path.setStyleSheet("color: #666; padding: 5px;")
-        nav_layout.addWidget(self.current_remote_path)
-        right_group.addLayout(nav_layout)
-
-        # 使用QListWidget显示远程文件
-        self.remote_list = QListWidget()
-        self.remote_list.setStyleSheet("""
-            QListWidget {
-                border: 1px solid #ccc;
-                border-radius: 4px;
-                padding: 5px;
-            }
-            QListWidget::item {
-                padding: 5px;
-                margin: 2px;
-            }
-            QListWidget::item:selected {
-                background-color: #e6f3ff;
-                color: black;
-            }
-        """)
-        right_group.addWidget(self.remote_list)
-
-        # 添加刷新按钮
-        refresh_btn = QPushButton("刷新远程文件")
-        refresh_btn.clicked.connect(self.request_file_list)
-        refresh_btn.setStyleSheet("""
-            QPushButton {
-                padding: 5px 10px;
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-        """)
-        right_group.addWidget(refresh_btn)
+        # 添加本地刷新按钮
+        refresh_local_btn = ctk.CTkButton(
+            left_frame,
+            text="刷新本地文件",
+            command=self.refresh_local_files
+        )
+        refresh_local_btn.pack(pady=5)
         
-        browser_layout.addLayout(right_group)
+        # 中间按钮区域
+        middle_frame = ctk.CTkFrame(browser_frame)
+        middle_frame.pack(side="left", padx=10)
         
-        layout.addLayout(browser_layout)
+        self.transfer_btn = ctk.CTkButton(
+            middle_frame,
+            text="推送 →",
+            command=self.transfer_selected_file
+        )
+        self.transfer_btn.pack(pady=5)
+        
+        self.pull_btn = ctk.CTkButton(
+            middle_frame,
+            text="← 拉取",
+            command=self.pull_selected_file
+        )
+        self.pull_btn.pack(pady=5)
+        
+        # 右侧远程文件
+        right_frame = ctk.CTkFrame(browser_frame, width=400)  # 设置固定宽度
+        right_frame.pack(side="right", fill="both", expand=True, padx=(5,0))
+        right_frame.pack_propagate(False)  # 防止子组件影响frame大小
+        
+        ctk.CTkLabel(right_frame, text="远程设备").pack()
+        
+        # 远程导航栏
+        remote_nav = ctk.CTkFrame(right_frame)
+        remote_nav.pack(fill="x")
+        
+        self.remote_drive_combo = ctk.CTkComboBox(
+            remote_nav,
+            width=100,
+            command=self.on_remote_drive_changed
+        )
+        self.remote_drive_combo.pack(side="left", padx=5)
+        self.remote_drive_combo.set("选择驱动器")  # 设置默认提示文本
+        
+        self.back_btn = ctk.CTkButton(
+            remote_nav,
+            text="返回上级",
+            command=self.go_to_parent_directory
+        )
+        self.back_btn.pack(side="left", padx=5)
+        
+        self.current_remote_path = ctk.CTkLabel(remote_nav, text="")
+        self.current_remote_path.pack(side="left", padx=5)
+        
+        # 远程文件列表
+        remote_list_frame = ctk.CTkFrame(right_frame)
+        remote_list_frame.pack(fill="both", expand=True)
+        
+        # 添加滚动条
+        remote_scrollbar_y = ttk.Scrollbar(remote_list_frame)
+        remote_scrollbar_y.pack(side="right", fill="y")
+        
+        remote_scrollbar_x = ttk.Scrollbar(remote_list_frame, orient="horizontal")
+        remote_scrollbar_x.pack(side="bottom", fill="x")
+        
+        self.remote_list = ttk.Treeview(
+            remote_list_frame,
+            selectmode="extended",
+            columns=("type", "name", "size"),
+            show="headings",
+            yscrollcommand=remote_scrollbar_y.set,
+            xscrollcommand=remote_scrollbar_x.set
+        )
+        self.remote_list.heading("type", text="类型", command=lambda: self.treeview_sort_column(self.remote_list, "type", False))
+        self.remote_list.heading("name", text="名称", command=lambda: self.treeview_sort_column(self.remote_list, "name", False))
+        self.remote_list.heading("size", text="大小", command=lambda: self.treeview_sort_column(self.remote_list, "size", False))
+        
+        # 设置列宽
+        self.remote_list.column("type", width=80, minwidth=60)
+        self.remote_list.column("name", width=200, minwidth=100)
+        self.remote_list.column("size", width=100, minwidth=80)
+        
+        self.remote_list.pack(fill="both", expand=True)
+        self.remote_list.bind("<Double-1>", self.remote_item_double_clicked)
+        
+        # 配置滚动条
+        remote_scrollbar_y.config(command=self.remote_list.yview)
+        remote_scrollbar_x.config(command=self.remote_list.xview)
+        
+        refresh_btn = ctk.CTkButton(
+            right_frame,
+            text="刷新远程文件",
+            command=self.request_file_list
+        )
+        refresh_btn.pack(pady=5)
         
         # 底部进度显示
-        progress_layout = QHBoxLayout()
+        progress_frame = ctk.CTkFrame(self)
+        progress_frame.pack(fill="x", padx=10, pady=5)
         
-        # 创建进度信息布局
-        progress_info = QVBoxLayout()
+        self.current_file_label = ctk.CTkLabel(progress_frame, text="当前文件: 无")
+        self.current_file_label.pack(side="left")
         
-        # 添加当前文件标签
-        self.current_file_label = QLabel("当前文件: 无")
-        progress_info.addWidget(self.current_file_label)
+        self.transfer_status = ctk.CTkLabel(progress_frame, text="传输速度: 0 MB/s")
+        self.transfer_status.pack(side="left", padx=10)
         
-        # 添加传输状态标签
-        self.transfer_status = QLabel("传输速度: 0 MB/s")
-        self.transfer_status.setStyleSheet("color: #666;")
-        progress_info.addWidget(self.transfer_status)
+        self.progress_bar = ctk.CTkProgressBar(progress_frame)
+        self.progress_bar.pack(fill="x", expand=True, padx=10)
+        self.progress_bar.set(0)
         
-        # 添加进度信息布局到主布局
-        progress_layout.addLayout(progress_info)
+    def setup_signals(self):
+        """设置所有信号连接"""
+        # 进度更新信号
+        self.signals.connect('progress_updated', 
+            lambda value: self.after(0, lambda: self.progress_bar.set(value / 100.0)))
         
-        # 添加进度条
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setStyleSheet("""
-            QProgressBar {
-                border: 1px solid #ccc;
-                border-radius: 5px;
-                text-align: center;
-                height: 20px;
-                min-width: 200px;
-            }
-            QProgressBar::chunk {
-                background-color: #4CAF50;
-            }
-        """)
-        progress_layout.addWidget(self.progress_bar)
+        # 传输完成信号
+        self.signals.connect('transfer_completed', 
+            lambda msg: self.after(0, lambda: self.on_transfer_completed(msg)))
         
-        # 添加进度布局到主布局
-        layout.addLayout(progress_layout)
+        # 错误信号
+        self.signals.connect('error_occurred', 
+            lambda msg: self.after(0, lambda: self.on_error(msg)))
         
-        # 设置按钮样式
-        button_style = """
-            QPushButton {
-                padding: 8px 15px;
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                min-width: 100px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-            }
-        """
-        for button in [self.connect_button, self.transfer_btn, self.pull_btn]:
-            button.setStyleSheet(button_style)
+        # 远程文件列表更新信号
+        self.signals.connect('remote_files_updated', 
+            lambda files, path: self.after(0, lambda: self.update_remote_files(files, path)))
         
-        # 连接信号
-        self.signals.progress_updated.connect(self.update_progress)
-        self.signals.transfer_completed.connect(self.on_transfer_completed)
-        self.signals.error_occurred.connect(self.on_error)
-        self.signals.remote_files_updated.connect(self.update_remote_files)
-        self.signals.speed_updated.connect(self.update_speed_display)
+        # 速度更新信号
+        self.signals.connect('speed_updated', 
+            lambda speed: self.after(0, lambda: self.transfer_status.configure(text=speed)))
         
-        # 修改远程文件列表的双击事件
-        self.remote_list.itemDoubleClicked.connect(self.remote_item_double_clicked)
-        
+        # 状态更新信号
+        self.signals.connect('status_updated',
+            lambda status: self.after(0, lambda: self.current_file_label.configure(text=status)))
+
     def transfer_selected_file(self):
+        """处理文件传输"""
         if not self.connected:
-            self.error_label.setText("请先连接到对方")
+            self.error_label.configure(text="请先连接到对方")
             return
-            
-        # 获取左侧选中的文件
-        selected_items = self.local_list.selectedItems()
+        
+        # 获取所有选中的文件
+        selected_items = self.local_list.selection()
         if not selected_items:
             return
+        
+        # 处理选中的文件
+        for item in selected_items:
+            values = self.local_list.item(item)['values']
+            if not values or values[0] != "文件":  # 检查是否为文件
+                continue
             
-        item_text = selected_items[0].text()
-        if not item_text.startswith("[文件]"):
-            self.error_label.setText("请选择文件而不是文件夹")
-            QTimer.singleShot(3000, lambda: self.error_label.clear())
-            return
+            file_name = values[1]  # 获取文件名
+            file_path = os.path.join(self.current_local_directory, file_name)
             
-        # 提取文件名（去掉[文件]标记和大小信息）
-        file_name = item_text.split("] ")[1].split(" (")[0]
-        file_path = os.path.join(self.current_local_directory, file_name)
-        
-        if not os.path.isfile(file_path):
-            self.error_label.setText("文件不存在")
-            QTimer.singleShot(3000, lambda: self.error_label.clear())
-            return
-
-        # 创建并启动传输线程
-        self.transfer_thread = FileTransferThread(
-            self.client_socket, 
-            file_path, 
-            self.current_remote_directory or os.path.join(os.path.expanduser("~"), "Downloads"), 
-            is_upload=True
-        )
-        
-        # 直接连接到更新函数
-        self.transfer_thread.progress_updated.connect(self.update_progress)
-        self.transfer_thread.speed_updated.connect(self.update_speed_display)  # 直接连接
-        self.transfer_thread.completed.connect(self.on_transfer_completed)
-        self.transfer_thread.error.connect(self.on_error)
-        self.transfer_thread.status_updated.connect(self.update_status)
-        
-        # 启动线程
-        self.transfer_thread.start()
+            if not os.path.isfile(file_path):
+                continue
+            
+            # 创建并启动传输线程
+            self.transfer_thread = FileTransferThread(
+                self.client_socket,
+                file_path,
+                self.current_remote_directory or os.path.join(os.path.expanduser("~"), "Downloads"),
+                is_upload=True,
+                signals=self.signals
+            )
+            
+            # 启动线程
+            self.transfer_thread.start()
 
     def send_file(self, file_path):
         try:
@@ -494,7 +548,7 @@ class FileTransferWindow(QMainWindow):
                 
             # 计算文件MD5
             md5_value = self.calculate_md5(file_path)
-            self.current_file_label.setText(f"正在发送: {file_name}")
+            self.current_file_label.configure(text=f"正在发送: {file_name}")
             
             save_path = self.current_remote_directory
             if not save_path:
@@ -514,20 +568,20 @@ class FileTransferWindow(QMainWindow):
                     self.client_socket.send(chunk)
                     bytes_sent += len(chunk)
                     progress = int((bytes_sent / file_size) * 100)
-                    self.signals.progress_updated.emit(progress)
+                    self.signals.emit('progress_updated', progress)
                     self.calculate_speed(bytes_sent)
                     
-            self.signals.transfer_completed.emit(f"已发送: {file_name}")
-            self.signals.speed_updated.emit("传输速度: 0 B/s")
+            self.signals.emit('transfer_completed', f"已发送: {file_name}")
+            self.signals.emit('speed_updated', "传输速度: 0 B/s")
             
         except Exception as e:
-            self.signals.error_occurred.emit(str(e))
+            self.signals.emit('error_occurred', str(e))
             self.disconnect_peer()
             
     def request_file_list(self):
         """请求远程文件列表"""
         if not self.connected:
-            self.error_label.setText("未连接到对方")
+            self.error_label.configure(text="未连接到对方")
             return
         try:
             print("发送文件列表请求")  # 添加调试信息
@@ -538,7 +592,7 @@ class FileTransferWindow(QMainWindow):
             self.client_socket.send(message.encode())
         except Exception as e:
             print(f"请求文件列表失败: {str(e)}")  # 添加调试信息
-            self.error_label.setText(f"请求文件列表失败: {str(e)}")
+            self.error_label.configure(text=f"请求文件列表失败: {str(e)}")
 
     def send_file_list(self):
         """发送本地文件列表给对方"""
@@ -548,6 +602,7 @@ class FileTransferWindow(QMainWindow):
             if os.name == 'nt':  # Windows系统
                 import win32api
                 drives = win32api.GetLogicalDriveStrings().split('\000')[:-1]
+                drives = [drive.rstrip('\\') for drive in drives if drive]  # 移除空值并去掉反斜杠
             else:  # Linux/Mac系统
                 drives = ['/']
 
@@ -619,7 +674,7 @@ class FileTransferWindow(QMainWindow):
             print("文件列表已发送")
         except Exception as e:
             print(f"发送文件列表失败: {str(e)}")
-            self.error_label.setText(f"发送文件列表失败: {str(e)}")
+            self.error_label.configure(text=f"发送文件列表失败: {str(e)}")
             
     def format_size(self, size):
         """格式化文件大小显示"""
@@ -632,102 +687,56 @@ class FileTransferWindow(QMainWindow):
     def update_remote_files(self, files, current_path=""):
         """更新远程文件列表显示"""
         try:
-            self.remote_list.clear()
+            self.remote_list.delete(*self.remote_list.get_children())
             self.remote_files = files
             self.current_remote_directory = current_path
             
             # 更新当前路径显示
             if current_path:
-                self.current_remote_path.setText(f"当前位置: {current_path}")
+                self.current_remote_path.configure(text=f"当前位置: {current_path}")
                 # 更新驱动器下拉框
                 if os.name == 'nt':
                     drive = os.path.splitdrive(current_path)[0]
                     if drive:
-                        index = self.remote_drive_combo.findText(drive)
-                        if index >= 0:
-                            self.remote_drive_combo.setCurrentIndex(index)
+                        self.remote_drive_combo.set(drive)
                 else:
-                    self.remote_drive_combo.clear()
+                    drives = []
                     for file in files:
                         if file.startswith("[驱动器]"):
                             drive = file.split("] ")[1].strip().rstrip('\\')
-                            self.remote_drive_combo.addItem(drive)
+                            drives.append(drive)
+                    self.remote_drive_combo.configure(values=drives)
+                    if drives:
+                        self.remote_drive_combo.set(drives[0])
             else:
-                self.current_remote_path.setText("当前位置: 根目录")
+                self.current_remote_path.configure(text="当前位置: 根目录")
                 # 更新远程驱动器列表
-                self.remote_drive_combo.clear()
+                drives = []
                 for file in files:
                     if file.startswith("[驱动器]"):
-                        drive = file.split("] ")[1].strip().rstrip('\\')
-                        self.remote_drive_combo.addItem(drive)
+                        drive = file.split("] ")[1].strip()
+                        drives.append(drive)
+                self.remote_drive_combo.configure(values=drives)
+                if drives:
+                    self.remote_drive_combo.set(drives[0])
             
+            # 更新文件列表
             for file in files:
-                item = file.strip()
-                self.remote_list.addItem(item)
-            
+                if file.startswith("[驱动器]"):
+                    drive = file.split("] ")[1].strip()
+                    self.remote_list.insert("", "end", values=("驱动器", drive.rstrip('\\'), ""))
+                elif file.startswith("[文件夹]"):
+                    folder = file.split("] ")[1].strip()
+                    self.remote_list.insert("", "end", values=("文件夹", folder, ""))
+                elif file.startswith("[文件]"):
+                    parts = file.split("] ")[1].split(" (")
+                    name = parts[0].strip()
+                    size = parts[1].rstrip(")")
+                    self.remote_list.insert("", "end", values=("文件", name, size))
+                
         except Exception as e:
             print(f"更新远程文件列表失败: {str(e)}")
-            self.error_label.setText(f"更新远程文件列表失败: {str(e)}")
-
-    def handle_message(self, data):
-        """处理接收到的消息"""
-        try:
-            message = json.loads(data)
-            if message['type'] == 'list_request':
-                self.send_file_list()
-            elif message['type'] == 'file_list':
-                self.signals.remote_files_updated.emit(message['files'], message['path'])
-        except json.JSONDecodeError:
-            # 如果不是JSON消息，按文件传输处理
-            return False
-        return True
-
-    def receive_files(self):
-        while self.connected and self.client_socket:
-            try:
-                data = b""
-                # 添加超时设置
-                self.client_socket.settimeout(60)  # 60秒超时
-                
-                # 接收消息头
-                while b"<<END>>" not in data:
-                    try:
-                        chunk = self.client_socket.recv(1024)
-                        if not chunk:
-                            raise ConnectionError("连接已断开")
-                        data += chunk
-                    except socket.timeout:
-                        continue
-                    except Exception as e:
-                        raise ConnectionError(f"接收数据失败: {str(e)}")
-
-                if not data:
-                    break
-
-                # 处理消息
-                if b"<<END>>" in data:
-                    parts = data.split(b"<<END>>", 1)
-                    message = parts[0].decode('utf-8', errors='ignore')
-                    remaining = parts[1] if len(parts) > 1 else b""
-
-                    try:
-                        # 尝试解析为JSON消息
-                        msg_data = json.loads(message)
-                        self.handle_json_message(msg_data)
-                    except json.JSONDecodeError:
-                        # 不是JSON消息，尝试处理为文件传输
-                        self.handle_file_transfer(message, remaining)
-
-            except ConnectionError as e:
-                print(f"连接错误: {str(e)}")
-                self.signals.error_occurred.emit(str(e))
-                break
-            except Exception as e:
-                print(f"接收错误: {str(e)}")
-                self.signals.error_occurred.emit(str(e))
-                break
-
-        self.disconnect_peer()
+            self.error_label.configure(text=f"更新远程文件列表失败: {str(e)}")
 
     def handle_json_message(self, msg_data):
         """处理JSON格式的消息"""
@@ -740,39 +749,42 @@ class FileTransferWindow(QMainWindow):
                 self.send_file_list()
             elif msg_data['type'] == 'file_list':
                 print(f"收到文件列表: {msg_data['files']}")
-                self.signals.remote_files_updated.emit(msg_data['files'], msg_data.get('path', ''))
+                self.signals.emit('remote_files_updated', msg_data['files'], msg_data.get('path', ''))
             elif msg_data['type'] == 'pull_request':
                 print(f"收到文件拉取请求: {msg_data}")
                 self.handle_pull_request(msg_data)
         except Exception as e:
             print(f"处理JSON消息失败: {str(e)}")
-            raise
+            self.signals.emit('error_occurred', str(e))
 
     def handle_file_transfer(self, message, remaining):
         """处理文件传输消息"""
         try:
             # 解析文件信息
             file_info = message.split('|')
-            if len(file_info) != 4:  # 文件名|文件大小|保存路径|MD5值
+            if len(file_info) != 4:
                 raise ValueError("无效的文件信息格式")
 
             file_name, file_size, save_path, md5_value = file_info
             file_size = int(file_size)
 
-            # 设置保存路径
             if not save_path:
                 save_path = os.path.join(os.path.expanduser("~"), "Downloads")
 
             print(f"保存文件到: {save_path}")
-            self.current_file_label.setText(f"正在接收: {file_name}")
+            self.current_file_label.configure(text=f"正在接收: {file_name}")
 
             # 创建保存目录
             os.makedirs(save_path, exist_ok=True)
             full_save_path = os.path.join(save_path, file_name)
 
+            # 优化socket配置
+            self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 524288)  # 512KB接收缓冲区
+            self.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # 禁用Nagle算法
+            
             # 接收文件内容
             self.last_transfer_time = time.time()
-            with open(full_save_path, 'wb') as f:
+            with open(full_save_path, 'wb', buffering=262144) as f:  # 使用256KB的文件缓冲区
                 bytes_received = 0
                 if remaining:
                     f.write(remaining)
@@ -780,14 +792,17 @@ class FileTransferWindow(QMainWindow):
 
                 while bytes_received < file_size:
                     try:
-                        chunk = self.client_socket.recv(min(8192, file_size - bytes_received))
+                        chunk = self.client_socket.recv(min(262144, file_size - bytes_received))
                         if not chunk:
                             raise ConnectionError("连接已断开")
                         f.write(chunk)
                         bytes_received += len(chunk)
-                        progress = int((bytes_received / file_size) * 100)
-                        self.signals.progress_updated.emit(progress)
-                        self.calculate_speed(bytes_received)
+                        
+                        # 降低进度更新频率
+                        if bytes_received % (262144 * 4) == 0:  # 每接收1MB更新一次进度
+                            progress = int((bytes_received / file_size) * 100)
+                            self.signals.emit('progress_updated', progress)
+                            self.calculate_speed(bytes_received)
                     except socket.timeout:
                         continue
 
@@ -796,17 +811,16 @@ class FileTransferWindow(QMainWindow):
             if received_md5 != md5_value:
                 raise ValueError("文件校验失败，传输可能不完整")
 
-            self.signals.transfer_completed.emit(f"已接收: {file_name}")
-            self.signals.speed_updated.emit("传输速度: 0 B/s")
+            self.signals.emit('transfer_completed', f"已接收: {file_name}")
+            self.signals.emit('speed_updated', "传输速度: 0 B/s")
 
-            # 更新文件列表
             if not self.is_server:
                 print("文件接收完成，请求更新文件列表")
-                QTimer.singleShot(100, self.request_file_list)
+                self.request_file_list()
 
         except Exception as e:
             print(f"文件接收失败: {str(e)}")
-            self.signals.error_occurred.emit(f"文件接收失败: {str(e)}")
+            self.signals.emit('error_occurred', f"文件接收失败: {str(e)}")
             raise
 
     def get_local_ip(self):
@@ -826,7 +840,7 @@ class FileTransferWindow(QMainWindow):
             self.server_socket.listen(1)
             threading.Thread(target=self.accept_connections, daemon=True).start()
         except Exception as e:
-            self.signals.error_occurred.emit(f"启动服务器失败: {str(e)}")
+            self.signals.emit('error_occurred', f"启动服务器失败: {str(e)}")
         
     def accept_connections(self):
         while True:
@@ -838,10 +852,10 @@ class FileTransferWindow(QMainWindow):
                     
                 self.client_socket = client_socket
                 self.connected = True
-                self.status_label.setText(f"已连接到: {addr[0]}")
+                self.status_label.configure(text=f"已连接到: {addr[0]}")
                 threading.Thread(target=self.receive_files, daemon=True).start()
             except Exception as e:
-                self.signals.error_occurred.emit(str(e))
+                self.signals.emit('error_occurred', str(e))
                 break
             
     def connect_to_peer(self):
@@ -850,10 +864,10 @@ class FileTransferWindow(QMainWindow):
             return
             
         try:
-            ip = self.ip_combo.currentText().strip()
+            ip = self.ip_combo.get()
             if not ip:
-                self.error_label.setText("请输入对方IP地址")
-                QTimer.singleShot(3000, lambda: self.error_label.clear())
+                self.error_label.configure(text="请输入对方IP地址")
+                self.after(3000, lambda: self.error_label.configure(text=""))
                 return
             
             # 保存IP到历史记录
@@ -863,23 +877,21 @@ class FileTransferWindow(QMainWindow):
                     self.ip_history.pop(0)
                 self.save_ip_history()
                 # 更新下拉列表
-                self.ip_combo.clear()
-                for hist_ip in self.ip_history:
-                    self.ip_combo.addItem(hist_ip)
+                self.ip_combo.configure(values=list(self.ip_history))
                 
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client_socket.connect((ip, self.port))
             self.connected = True
             self.is_server = False
-            self.status_label.setText(f"已连接到: {ip}")
-            self.connect_button.setText("断开连接")
-            self.ip_combo.setEnabled(False)
+            self.status_label.configure(text=f"已连接到: {ip}")
+            self.connect_button.configure(text="断开连接")
+            self.ip_combo.configure(state="disabled")
             
             threading.Thread(target=self.receive_files, daemon=True).start()
-            QTimer.singleShot(500, self.request_file_list)
+            self.after(500, self.request_file_list)
             
         except Exception as e:
-            self.signals.error_occurred.emit(str(e))
+            self.signals.emit('error_occurred', str(e))
             self.client_socket = None
 
     def load_ip_history(self):
@@ -903,9 +915,9 @@ class FileTransferWindow(QMainWindow):
             print(f"保存IP历史记录失败: {str(e)}")
 
     def disconnect_peer(self):
-        if self.transfer_thread and self.transfer_thread.isRunning():
+        if self.transfer_thread and self.transfer_thread.is_alive():
             self.transfer_thread.running = False
-            self.transfer_thread.wait()
+            self.transfer_thread.join()
             
         self.connected = False
         if self.client_socket:
@@ -916,84 +928,106 @@ class FileTransferWindow(QMainWindow):
                 pass
             self.client_socket = None
 
-        self.status_label.setText("等待连接...")
-        self.connect_button.setText("连接")
-        self.ip_combo.setEnabled(True)
-        self.progress_bar.setValue(0)
-        self.current_file_label.setText("当前文件: 无")
-        self.transfer_status.clear()
-        self.error_label.clear()
+        self.status_label.configure(text="等待连接...")
+        self.connect_button.configure(text="连接")
+        self.ip_combo.configure(state="normal")
+        self.progress_bar.set(0)
+        self.current_file_label.configure(text="当前文件: 无")
+        self.transfer_status.configure(text="传输速度: 0 MB/s")
+        self.error_label.configure(text="")
         self.is_server = True
         
-    def on_transfer_completed(self, file_name):
-        self.progress_bar.setValue(0)
-        self.current_file_label.setText("当前文件: 无")
-        # 更新传输状态显示，3秒后清除
-        self.transfer_status.setText(file_name)
-        QTimer.singleShot(3000, lambda: self.transfer_status.clear())
-        # 如果是接收文件，刷新文件列表
-        if not self.is_server:
-            self.request_file_list()
-            
+    def on_transfer_completed(self, message):
+        """传输完成处理"""
+        self.current_file_label.configure(text=message)
+        self.progress_bar.set(100)
+        self.transfer_status.configure(text="传输速度: 0 MB/s")
+        
     def on_error(self, error_msg):
         # 根据错误类型显示不同的提示
         if "10053" in error_msg:  # 连接断开
-            self.error_label.setText("连接已断开")
+            self.error_label.configure(text="连接已断开")
         elif "10061" in error_msg:  # 连接被拒绝
-            self.error_label.setText("连接被拒绝")
+            self.error_label.configure(text="连接被拒绝")
         else:
-            self.error_label.setText("传输错误")
+            self.error_label.configure(text="传输错误")
         
         # 3秒后清除错误提示
-        QTimer.singleShot(3000, lambda: self.error_label.clear())
+        self.after(3000, lambda: self.error_label.configure(text=""))
         
         # 重置状态
-        self.progress_bar.setValue(0)
-        self.current_file_label.setText("当前文件: 无")
+        self.progress_bar.set(0)
+        self.current_file_label.configure(text="当前文件: 无")
         self.disconnect_peer()
         
-    def closeEvent(self, event):
+    def close(self):
         """关闭窗口时保存IP历史记录"""
         self.save_ip_history()
         if self.client_socket:
             self.client_socket.close()
         if hasattr(self, 'server_socket'):
             self.server_socket.close()
-        event.accept() 
+        self.destroy()
         
     def select_save_directory(self):
-        dir_path = QFileDialog.getExistingDirectory(self, "选择保存位置", self.save_dir)
+        dir_path = ctk.CTk.askdirectory(self, title="选择保存位置", initialdir=self.save_dir)
         if dir_path:
             self.save_dir = dir_path
-            self.save_path_label.setText(f"下载位置: {self.save_dir}")
+            self.current_local_path.configure(text=f"当前位置: {self.save_dir}")
             
-    def format_size(self, size):
-        """格式化文件大小显示"""
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if size < 1024:
-                return f"{size:.1f}{unit}"
-            size /= 1024
-        return f"{size:.1f}TB"
+    def local_item_double_clicked(self, event):
+        """处理本地文件列表的双击事件"""
+        try:
+            selected_item = self.local_list.selection()[0]
+            values = self.local_list.item(selected_item)['values']
+            item_type = values[0]  # 第一列是类型
+            item_name = values[1]  # 第二列是名称
+            
+            if item_type == "驱动器":
+                # 如果是驱动器，直接使用驱动器路径
+                path = item_name
+                if os.name == 'nt' and not path.endswith('\\'):
+                    path = path + '\\'
+                print(f"打开本地驱动器: {path}")
+                self.update_local_files(path)
+            elif item_type == "文件夹":
+                # 如果是文件夹，拼接完整路径
+                if self.current_local_directory:
+                    path = os.path.join(self.current_local_directory, item_name)
+                else:
+                    path = item_name
+                print(f"打开本地文件夹: {path}")
+                self.update_local_files(path)
+        except Exception as e:
+            print(f"处理本地双击事件失败: {str(e)}")
+            self.error_label.configure(text=f"打开本地文件夹失败: {str(e)}")
 
-    def remote_item_double_clicked(self, item):
+    def remote_item_double_clicked(self, event):
         """处理远程文件列表的双击事件"""
         try:
-            text = item.text()
-            if text.startswith("[驱动器]"):
-                # 提取驱动器路径，保留完整路径（如 "C:\"）
-                path = text.split("] ")[1].strip()
-                if os.name == 'nt' and not path.endswith('\\'): 
-                    path = path + '\\'  # 确保Windows驱动器路径以反斜杠结尾
-                print(f"请求打开驱动器: {path}")
-                self.current_remote_directory = path  # 设置当前远程目录
-            elif text.startswith("[文件夹]"):
+            selected_item = self.remote_list.selection()[0]
+            values = self.remote_list.item(selected_item)['values']
+            if not values:  # 检查是否有选中的项目
+                return
+            
+            item_type = values[0]  # 第一列是类型
+            item_name = values[1]  # 第二列是名称
+            
+            if item_type == "驱动器":
+                # 如果是驱动器，直接使用驱动器路径
+                path = item_name
+                if os.name == 'nt' and not path.endswith('\\'):
+                    path = path + '\\'
+                print(f"请求打开远程驱动器: {path}")
+                self.current_remote_directory = path
+            elif item_type == "文件夹":
                 # 如果是文件夹，拼接完整路径
-                folder_name = text.split("] ")[1].strip()
                 if self.current_remote_directory:
-                    path = os.path.join(self.current_remote_directory, folder_name)
+                    path = os.path.join(self.current_remote_directory, item_name)
                 else:
-                    path = folder_name
-                print(f"请求打开文件夹: {path}")
+                    path = item_name
+                print(f"请求打开远程文件夹: {path}")
+                self.current_remote_directory = path
             else:
                 return
 
@@ -1003,10 +1037,17 @@ class FileTransferWindow(QMainWindow):
                 'path': path
             }
             message = json.dumps(request) + "<<END>>"
-            self.client_socket.send(message.encode())
+            try:
+                self.client_socket.send(message.encode())
+            except Exception as e:
+                print(f"发送远程文件列表请求失败: {str(e)}")
+                self.error_label.configure(text=f"请求远程文件列表失败: {str(e)}")
+                self.after(3000, lambda: self.error_label.configure(text=""))
+            
         except Exception as e:
-            print(f"处理双击事件失败: {str(e)}")
-            self.error_label.setText(f"打开文件夹失败: {str(e)}")
+            print(f"处理远程双击事件失败: {str(e)}")
+            self.error_label.configure(text=f"打开远程文件夹失败: {str(e)}")
+            self.after(3000, lambda: self.error_label.configure(text=""))
 
     def go_to_parent_directory(self):
         """返回远程上级目录"""
@@ -1041,71 +1082,64 @@ class FileTransferWindow(QMainWindow):
                 self.client_socket.send(message.encode())
             except Exception as e:
                 print(f"返回上级目录失败: {str(e)}")
-                self.error_label.setText(f"返回上级目录失败: {str(e)}")
-                QTimer.singleShot(3000, lambda: self.error_label.clear())
+                self.error_label.configure(text=f"返回上级目录失败: {str(e)}")
+                self.after(3000, lambda: self.error_label.configure(text=""))
         except Exception as e:
             print(f"返回上级目录操作失败: {str(e)}")
-            self.error_label.setText(f"返回上级目录操作失败: {str(e)}")
-            QTimer.singleShot(3000, lambda: self.error_label.clear())
+            self.error_label.configure(text=f"返回上级目录操作失败: {str(e)}")
+            self.after(3000, lambda: self.error_label.configure(text=""))
 
-    def update_local_files(self, path=""):
+    def update_local_files(self, path):
         """更新本地文件列表显示"""
         try:
-            self.local_list.clear()
+            self.local_list.delete(*self.local_list.get_children())
+            self.current_local_directory = path
             
-            # 如果没有指定路径，显示驱动器列表
-            if not path:
-                if os.name == 'nt':  # Windows系统
-                    import win32api
-                    drives = win32api.GetLogicalDriveStrings().split('\000')[:-1]
-                    for drive in drives:
-                        self.local_list.addItem(f"[驱动器] {drive}")
-                else:  # Linux/Mac系统
-                    self.local_list.addItem("[驱动器] /")
-                self.current_local_path.setText("当前位置: 根目录")
+            # 更新当前路径显示
+            if path:
+                self.current_local_path.configure(text=f"当前位置: {path}")
             else:
-                # 显示当前目录的内容
-                self.current_local_path.setText(f"当前位置: {path}")
+                self.current_local_path.configure(text="当前位置: 根目录")
+            
+            # 获取驱动器列表
+            if os.name == 'nt':  # Windows系统
+                import win32api
+                drives = win32api.GetLogicalDriveStrings().split('\000')[:-1]
+                drives = [drive.rstrip('\\') for drive in drives if drive]
+            else:  # Linux/Mac系统
+                drives = ['/']
+            
+            # 如果是空路径或根目录，显示驱动器列表
+            if not path:
+                for drive in drives:
+                    self.local_list.insert("", "end", values=("驱动器", drive, ""))
+                return
+            
+            # 显示当前目录的文件和文件夹
+            try:
                 for item in os.listdir(path):
                     item_path = os.path.join(path, item)
                     try:
                         if os.path.isfile(item_path):
                             size = os.path.getsize(item_path)
                             size_str = self.format_size(size)
-                            self.local_list.addItem(f"[文件] {item} ({size_str})")
+                            self.local_list.insert("", "end", values=("文件", item, size_str))
                         else:
-                            self.local_list.addItem(f"[文件夹] {item}")
+                            self.local_list.insert("", "end", values=("文件夹", item, ""))
                     except Exception as e:
-                        print(f"处理本地文件 {item} 时出错: {str(e)}")
+                        print(f"处理文件 {item} 时出错: {str(e)}")
                         continue
-            
-            self.current_local_directory = path
+            except Exception as e:
+                print(f"读取目录 {path} 失败: {str(e)}")
+                # 如果读取失败，显示驱动器列表
+                for drive in drives:
+                    self.local_list.insert("", "end", values=("驱动器", drive, ""))
+                self.current_local_directory = ""
+                self.current_local_path.configure(text="当前位置: 根目录")
             
         except Exception as e:
             print(f"更新本地文件列表失败: {str(e)}")
-            self.error_label.setText(f"更新本地文件列表失败: {str(e)}")
-
-    def local_item_double_clicked(self, item):
-        """处理本地文件列表的双击事件"""
-        try:
-            text = item.text()
-            if text.startswith("[驱动器]"):
-                # 提取驱动器路径
-                path = text.split("] ")[1].strip()
-                print(f"打开本地驱动器: {path}")
-                self.update_local_files(path)
-            elif text.startswith("[文件夹]"):
-                # 如果是文件夹，拼接完整路径
-                folder_name = text.split("] ")[1].strip()
-                if self.current_local_directory:
-                    path = os.path.join(self.current_local_directory, folder_name)
-                else:
-                    path = folder_name
-                print(f"打开本地文件夹: {path}")
-                self.update_local_files(path)
-        except Exception as e:
-            print(f"处理本地双击事件失败: {str(e)}")
-            self.error_label.setText(f"打开本地文件夹失败: {str(e)}")
+            self.error_label.configure(text=f"更新本地文件列表失败: {str(e)}")
 
     def local_go_to_parent_directory(self):
         """返回本地上级目录"""
@@ -1129,93 +1163,83 @@ class FileTransferWindow(QMainWindow):
             self.update_local_files(parent_path)
 
     def pull_selected_file(self):
-        """拉取远程文件到本地"""
+        """处理文件拉取"""
         if not self.connected:
-            self.error_label.setText("请先连接到对方")
+            self.error_label.configure(text="请先连接到对方")
             return
-            
-        # 获取右侧选中的文件
-        selected_items = self.remote_list.selectedItems()
+        
+        # 获取所有选中的远程文件
+        selected_items = self.remote_list.selection()
         if not selected_items:
             return
+        
+        # 直接处理选中的文件
+        for item in selected_items:
+            values = self.remote_list.item(item)['values']
+            if not values or values[0] != "文件":  # 检查是否为文件
+                continue
             
-        item_text = selected_items[0].text()
-        if not item_text.startswith("[文件]"):
-            self.error_label.setText("请选择文件而不是文件夹")
-            QTimer.singleShot(3000, lambda: self.error_label.clear())
-            return
+            file_name = values[1]  # 获取文件名
             
-        # 提取文件名（去掉[文件]标记和大小信息）
-        file_name = item_text.split("] ")[1].split(" (")[0]
-        
-        # 使用当前本地目录作为保存位置
-        save_path = self.current_local_directory
-        if not save_path:
-            save_path = os.path.join(os.path.expanduser("~"), "Downloads")
-        
-        # 构造请求消息
-        request = {
-            'type': 'pull_request',
-            'file_name': file_name,
-            'path': self.current_remote_directory,
-            'save_path': save_path  # 添加保存路径
-        }
-        
-        try:
-            message = json.dumps(request) + "<<END>>"
-            self.client_socket.send(message.encode())
-        except Exception as e:
-            self.error_label.setText(f"请求文件失败: {str(e)}")
-            QTimer.singleShot(3000, lambda: self.error_label.clear())
+            # 构造拉取请求
+            request = {
+                'type': 'pull_request',
+                'file_names': [file_name],
+                'paths': [self.current_remote_directory],
+                'save_paths': [self.current_local_directory or os.path.join(os.path.expanduser("~"), "Downloads")]
+            }
+            
+            try:
+                message = json.dumps(request) + "<<END>>"
+                self.client_socket.send(message.encode())
+            except Exception as e:
+                print(f"发送拉取请求失败: {str(e)}")
+                self.error_label.configure(text=f"发送拉取请求失败: {str(e)}")
+                self.after(3000, lambda: self.error_label.configure(text=""))
 
     def handle_pull_request(self, msg_data):
         """处理文件拉取请求"""
         try:
-            file_name = msg_data['file_name']
-            path = msg_data.get('path', '')
-            save_path = msg_data.get('save_path', '')
+            file_names = msg_data['file_names']
+            paths = msg_data.get('paths', [])
+            save_paths = msg_data.get('save_paths', [])
 
-            if not path:
+            if not paths:
                 raise Exception("无效的文件路径")
 
-            file_path = os.path.join(path, file_name)
-            if not os.path.isfile(file_path):
-                raise Exception("文件不存在")
+            for file_name, path, save_path in zip(file_names, paths, save_paths):
+                file_path = os.path.join(path, file_name)
+                if not os.path.isfile(file_path):
+                    raise Exception(f"文件 {file_name} 不存在")
 
-            # 创建并启动传输线程
-            self.transfer_thread = FileTransferThread(
-                self.client_socket, 
-                file_path, 
-                save_path, 
-                is_upload=True
-            )
-            
-            # 连接信号
-            self.transfer_thread.progress_updated.connect(self.update_progress)
-            self.transfer_thread.speed_updated.connect(self.update_speed_display)
-            self.transfer_thread.completed.connect(self.on_transfer_completed)
-            self.transfer_thread.error.connect(self.on_error)
-            self.transfer_thread.status_updated.connect(self.update_status)
-            
-            # 启动线程
-            self.transfer_thread.start()
+                # 创建并启动传输线程
+                self.transfer_thread = FileTransferThread(
+                    self.client_socket, 
+                    file_path, 
+                    save_path, 
+                    is_upload=True,
+                    signals=self.signals
+                )
+                
+                # 启动线程
+                self.transfer_thread.start()
 
         except Exception as e:
             print(f"处理拉取请求失败: {str(e)}")
-            self.error_label.setText(f"处理拉取请求失败: {str(e)}")
-            QTimer.singleShot(3000, lambda: self.error_label.clear())
+            self.error_label.configure(text=f"处理拉取请求失败: {str(e)}")
+            self.after(3000, lambda: self.error_label.configure(text=""))
 
     def update_status(self, status):
         """更新状态显示"""
-        self.current_file_label.setText(status)
+        self.current_file_label.configure(text=status)
 
     def update_progress(self, value):
         """更新进度条"""
-        self.progress_bar.setValue(value)
+        self.progress_bar.set(value / 100.0)  # customtkinter进度条值范围是0-1
 
     def update_speed_display(self, speed):
         """更新速度显示"""
-        self.transfer_status.setText(speed)
+        self.transfer_status.configure(text=speed)
 
     def calculate_speed(self, total_bytes):
         """计算实际每秒传输速度"""
@@ -1232,7 +1256,7 @@ class FileTransferWindow(QMainWindow):
                 speed = bytes_diff / time_diff
                 speed_mb = speed / (1024 * 1024)
                 speed_str = f"{speed_mb:.2f} MB/s"
-                self.signals.speed_updated.emit(f"传输速度: {speed_str}")
+                self.signals.emit('speed_updated', speed_str)
             
             # 更新记录
             self.last_bytes = total_bytes
@@ -1246,49 +1270,6 @@ class FileTransferWindow(QMainWindow):
                 md5_hash.update(chunk)
         return md5_hash.hexdigest()
 
-    def send_file(self, file_path):
-        try:
-            if not self.connected or not self.client_socket:
-                raise Exception("未连接到对方")
-                
-            file_size = os.path.getsize(file_path)
-            file_name = os.path.basename(file_path)
-            
-            if file_size == 0:
-                raise Exception("文件为空")
-                
-            # 计算文件MD5
-            md5_value = self.calculate_md5(file_path)
-            self.current_file_label.setText(f"正在发送: {file_name}")
-            
-            save_path = self.current_remote_directory
-            if not save_path:
-                save_path = os.path.join(os.path.expanduser("~"), "Downloads")
-            
-            # 发送文件信息（包含MD5值）
-            header = f"{file_name}|{file_size}|{save_path}|{md5_value}<<END>>".encode()
-            self.client_socket.send(header)
-            
-            self.last_transfer_time = time.time()
-            with open(file_path, 'rb') as f:
-                bytes_sent = 0
-                while bytes_sent < file_size:
-                    chunk = f.read(8192)
-                    if not chunk:
-                        break
-                    self.client_socket.send(chunk)
-                    bytes_sent += len(chunk)
-                    progress = int((bytes_sent / file_size) * 100)
-                    self.signals.progress_updated.emit(progress)
-                    self.calculate_speed(bytes_sent)
-                    
-            self.signals.transfer_completed.emit(f"已发送: {file_name}")
-            self.signals.speed_updated.emit("传输速度: 0 B/s")
-            
-        except Exception as e:
-            self.signals.error_occurred.emit(str(e))
-            self.disconnect_peer()
-            
     def receive_files(self):
         while self.connected and self.client_socket:
             try:
@@ -1327,25 +1308,34 @@ class FileTransferWindow(QMainWindow):
 
             except ConnectionError as e:
                 print(f"连接错误: {str(e)}")
-                self.signals.error_occurred.emit(str(e))
+                self.signals.emit('error_occurred', str(e))
                 break
             except Exception as e:
                 print(f"接收错误: {str(e)}")
-                self.signals.error_occurred.emit(str(e))
+                self.signals.emit('error_occurred', str(e))
                 break
 
         self.disconnect_peer()
 
     def update_drive_list(self, combo_box):
         """更新驱动器列表"""
-        combo_box.clear()
         if os.name == 'nt':  # Windows系统
             import win32api
             drives = win32api.GetLogicalDriveStrings().split('\000')[:-1]
-            for drive in drives:
-                combo_box.addItem(drive.rstrip('\\'))
+            drives = [drive.rstrip('\\') for drive in drives if drive]  # 移除空值并去掉反斜杠
+            combo_box.configure(values=drives)  # 设置所有驱动器为下拉选项
+            
+            # 不设置默认值，让用户自己选择
+            combo_box.set("选择驱动器")
+            
+            # 如果是本地驱动器列表，立即更新文件列表显示所有驱动器
+            if combo_box == self.local_drive_combo:
+                self.update_local_files("")  # 传入空字符串显示所有驱动器
         else:  # Linux/Mac系统
-            combo_box.addItem('/')
+            combo_box.configure(values=['/'])
+            combo_box.set('/')
+            if combo_box == self.local_drive_combo:
+                self.update_local_files('/')
 
     def on_local_drive_changed(self, drive):
         """处理本地驱动器选择变化"""
@@ -1358,7 +1348,15 @@ class FileTransferWindow(QMainWindow):
         """处理远程驱动器选择变化"""
         if drive and self.connected:
             if os.name == 'nt':
-                drive = drive + '\\'
+                # 确保驱动器路径格式正确
+                drive = drive.rstrip('\\') + '\\'
+            else:
+                drive = '/'
+            
+            print(f"切换到远程驱动器: {drive}")
+            self.current_remote_directory = drive  # 更新当前远程目录
+            
+            # 发送请求获取该驱动器的文件列表
             request = {
                 'type': 'list_request',
                 'path': drive
@@ -1368,44 +1366,61 @@ class FileTransferWindow(QMainWindow):
                 self.client_socket.send(message.encode())
             except Exception as e:
                 print(f"请求远程目录失败: {str(e)}")
-                self.error_label.setText(f"请求远程目录失败: {str(e)}")
+                self.error_label.configure(text=f"请求远程目录失败: {str(e)}")
 
-    def update_remote_files(self, files, current_path=""):
-        """更新远程文件列表显示"""
+    def refresh_local_files(self):
+        """刷新本地文件列表"""
         try:
-            self.remote_list.clear()
-            self.remote_files = files
-            self.current_remote_directory = current_path
-            
-            # 更新当前路径显示
-            if current_path:
-                self.current_remote_path.setText(f"当前位置: {current_path}")
-                # 更新驱动器下拉框
-                if os.name == 'nt':
-                    drive = os.path.splitdrive(current_path)[0]
-                    if drive:
-                        index = self.remote_drive_combo.findText(drive)
-                        if index >= 0:
-                            self.remote_drive_combo.setCurrentIndex(index)
-                else:
-                    self.remote_drive_combo.clear()
-                    for file in files:
-                        if file.startswith("[驱动器]"):
-                            drive = file.split("] ")[1].strip().rstrip('\\')
-                            self.remote_drive_combo.addItem(drive)
+            # 如果当前目录为空，显示驱动器列表
+            if not self.current_local_directory:
+                self.update_local_files("")
             else:
-                self.current_remote_path.setText("当前位置: 根目录")
-                # 更新远程驱动器列表
-                self.remote_drive_combo.clear()
-                for file in files:
-                    if file.startswith("[驱动器]"):
-                        drive = file.split("] ")[1].strip().rstrip('\\')
-                        self.remote_drive_combo.addItem(drive)
-            
-            for file in files:
-                item = file.strip()
-                self.remote_list.addItem(item)
-            
+                # 刷新当前目录
+                self.update_local_files(self.current_local_directory)
         except Exception as e:
-            print(f"更新远程文件列表失败: {str(e)}")
-            self.error_label.setText(f"更新远程文件列表失败: {str(e)}") 
+            print(f"刷新本地文件列表失败: {str(e)}")
+            self.error_label.configure(text=f"刷新本地文件列表失败: {str(e)}")
+            self.after(3000, lambda: self.error_label.configure(text="")) 
+
+    def treeview_sort_column(self, tree, col, reverse):
+        """排序 Treeview 的列"""
+        l = [(tree.set(k, col), k) for k in tree.get_children('')]
+        
+        # 自定义排序函数
+        def convert_size(size_str):
+            if not size_str:
+                return 0
+            try:
+                # 提取数字和单位
+                match = re.match(r"([\d.]+)([KMGT]?B)", size_str)
+                if not match:
+                    return 0
+                    
+                number = float(match.group(1))
+                unit = match.group(2)
+                
+                # 转换到字节
+                multipliers = {
+                    'B': 1,
+                    'KB': 1024,
+                    'MB': 1024 ** 2,
+                    'GB': 1024 ** 3,
+                    'TB': 1024 ** 4
+                }
+                
+                return number * multipliers.get(unit, 1)
+            except:
+                return 0
+        
+        # 根据列类型选择排序方法
+        if col == "size":
+            l.sort(key=lambda x: convert_size(x[0]), reverse=reverse)
+        else:
+            l.sort(reverse=reverse)
+        
+        # 重新排列项目
+        for index, (val, k) in enumerate(l):
+            tree.move(k, '', index)
+        
+        # 切换排序方向
+        tree.heading(col, command=lambda: self.treeview_sort_column(tree, col, not reverse)) 

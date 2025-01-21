@@ -1,13 +1,8 @@
 # GUI 框架
-PyQt5==5.15.9
-PyQt5-Qt5==5.15.2
-PyQt5-sip==12.12.2
+customtkinter==5.2.2
 
 # 系统相关
 pywin32==305; platform_system == "Windows"
-
-# 网络和文件传输
-tqdm==4.66.2  # 用于显示进度条
 
 # 图像处理
 Pillow==10.2.0  # 用于图标转换 

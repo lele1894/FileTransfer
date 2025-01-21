@@ -1,20 +1,16 @@
 import sys
-from PyQt5.QtWidgets import QApplication
-from PyQt5.QtGui import QIcon
+import customtkinter as ctk
 import os
 from file_transfer import FileTransferWindow
 
 def main():
-    app = QApplication(sys.argv)
+    ctk.set_appearance_mode("System")  # 跟随系统主题
+    ctk.set_default_color_theme("blue")  # 设置默认颜色主题
     
-    # 设置应用程序图标
-    icon_path = os.path.join(os.path.dirname(__file__), 'assets', '1024x1024.jpeg')
-    if os.path.exists(icon_path):
-        app.setWindowIcon(QIcon(icon_path))
-    
-    window = FileTransferWindow()
-    window.show()
-    sys.exit(app.exec_())
+    window = FileTransferWindow(port=5000)
+    window.geometry("1200x700")  # 设置初始窗口大小
+    window.minsize(800, 600)     # 设置最小窗口大小
+    window.mainloop()
 
 if __name__ == '__main__':
     main() 

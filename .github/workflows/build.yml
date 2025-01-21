@@ -1,12 +1,6 @@
 name: Build Windows Executable
 
 on:
-  push:
-    branches: [ main ]
-    tags:
-      - 'v*.*.*'
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
     inputs:
       tag_version:
@@ -26,10 +20,16 @@ jobs:
       with:
         fetch-depth: 0
     
+    - name: Delete existing tag if exists
+      run: |
+        git tag -d ${{ github.event.inputs.tag_version }} 2>$null
+        git push origin :refs/tags/${{ github.event.inputs.tag_version }} 2>$null
+      continue-on-error: true
+    
     - name: Create Tag
-      if: github.event_name == 'workflow_dispatch'
       run: |
         git tag ${{ github.event.inputs.tag_version }}
+        git push origin ${{ github.event.inputs.tag_version }} --force
     
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -42,30 +42,12 @@ jobs:
         pip install customtkinter==5.2.2 pywin32==305 Pillow==10.2.0
         pip install pyinstaller==6.3.0
         
-    - name: Convert JPEG to ICO
-      run: |
-        python -c "
-        from PIL import Image
-        img = Image.open('tb.jpeg')
-        # 确保图片是正方形
-        size = min(img.size)
-        img = img.crop(((img.size[0] - size) // 2, (img.size[1] - size) // 2, 
-                       (img.size[0] + size) // 2, (img.size[1] + size) // 2))
-        # 生成多个尺寸的图标
-        sizes = [(16,16), (32,32), (48,48), (64,64), (128,128), (256,256)]
-        icons = []
-        for size in sizes:
-            icons.append(img.resize(size, Image.Resampling.LANCZOS))
-        # 保存为ICO，包含所有尺寸
-        icons[0].save('icon.ico', format='ICO', sizes=sizes, append_images=icons[1:])
-        "
-        
     - name: Build with PyInstaller
       run: |
         pyinstaller --noconfirm --onefile --windowed `
           --name "FileTransfer" `
-          --add-data "tb.jpeg;." `
-          --icon "icon.ico" `
+          --add-data "tb.png;." `
+          --icon "tb.png" `
           --version-file "version.txt" `
           --hidden-import win32api `
           --hidden-import win32con `
@@ -78,18 +60,17 @@ jobs:
         path: dist/FileTransfer.exe
         
     - name: Create Release
-      if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       uses: softprops/action-gh-release@v1
       with:
-        name: 文件快传 ${{ github.event.inputs.tag_version || github.ref_name }}
-        tag_name: ${{ github.event.inputs.tag_version || github.ref_name }}
+        name: 文件快传 ${{ github.event.inputs.tag_version }}
+        tag_name: ${{ github.event.inputs.tag_version }}
         body: |
-          ## 文件快传 ${{ github.event.inputs.tag_version || github.ref_name }}
+          ## 文件快传 ${{ github.event.inputs.tag_version }}
           
           ### 下载
-          - [Windows 可执行文件](https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.tag_version || github.ref_name }}/FileTransfer.exe)
+          - [Windows 可执行文件](https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.tag_version }}/FileTransfer.exe)
           
           ### 系统要求
           - Windows 7/8/10/11

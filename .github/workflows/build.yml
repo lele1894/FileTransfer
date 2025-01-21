@@ -44,7 +44,21 @@ jobs:
         
     - name: Convert JPEG to ICO
       run: |
-        python -c "from PIL import Image; img = Image.open('tb.jpeg'); img.save('icon.ico', format='ICO', sizes=[(256, 256)])"
+        python -c "
+        from PIL import Image
+        img = Image.open('tb.jpeg')
+        # 确保图片是正方形
+        size = min(img.size)
+        img = img.crop(((img.size[0] - size) // 2, (img.size[1] - size) // 2, 
+                       (img.size[0] + size) // 2, (img.size[1] + size) // 2))
+        # 生成多个尺寸的图标
+        sizes = [(16,16), (32,32), (48,48), (64,64), (128,128), (256,256)]
+        icons = []
+        for size in sizes:
+            icons.append(img.resize(size, Image.Resampling.LANCZOS))
+        # 保存为ICO，包含所有尺寸
+        icons[0].save('icon.ico', format='ICO', sizes=sizes, append_images=icons[1:])
+        "
         
     - name: Build with PyInstaller
       run: |

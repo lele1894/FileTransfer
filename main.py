@@ -8,7 +8,7 @@ def main():
     ctk.set_default_color_theme("blue")  # 设置默认颜色主题
     
     window = FileTransferWindow(port=5000)
-    window.geometry("1200x700")  # 设置初始窗口大小
+    window.geometry("1200x800")  # 设置初始窗口大小
     window.minsize(800, 600)     # 设置最小窗口大小
     window.mainloop()
 

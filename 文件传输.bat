@@ -1,0 +1,1 @@
+python G:\GitHub\FileTransfer\main.py

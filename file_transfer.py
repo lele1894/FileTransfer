@@ -58,8 +58,35 @@ class FileTransferThread(threading.Thread):
         self._last_update = time.time()
         self._update_interval = 0.5
         self._last_bytes = 0
-        self._chunk_size = 262144  # 增加到256KB的块大小
-        self._progress_update_interval = 0.2  # 降低进度更新频率
+        self._chunk_size = 262144  # 256KB的块大小
+        self._progress_update_interval = 0.2
+        self._timeout = 30  # 30秒超时
+        self._retry_count = 3  # 最大重试次数
+
+    def _handle_timeout(self, operation):
+        """处理超时情况"""
+        retry_count = 0
+        last_error = None
+        
+        while retry_count < self._retry_count and self.running:
+            try:
+                return operation()
+            except socket.timeout as e:
+                retry_count += 1
+                last_error = e
+                if retry_count >= self._retry_count:
+                    break
+                time.sleep(1)  # 等待1秒后重试
+            except socket.error as e:
+                retry_count += 1
+                last_error = e
+                if retry_count >= self._retry_count:
+                    break
+                time.sleep(1)
+                
+        if last_error:
+            raise Exception(f"操作失败，已重试{self._retry_count}次: {str(last_error)}")
+        return None
 
     def run(self):
         try:
@@ -81,34 +108,63 @@ class FileTransferThread(threading.Thread):
 
             # 发送文件信息
             header = f"{file_name}|{file_size}|{self.save_path}|{md5_value}<<END>>"
-            self.socket.sendall(header.encode())
+            self._handle_timeout(lambda: self.socket.sendall(header.encode()))
 
             # 优化socket配置
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 524288)  # 512KB发送缓冲区
-            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # 禁用Nagle算法
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)  # 1MB发送缓冲区
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.socket.settimeout(self._timeout)
             
             # 发送文件内容
             bytes_sent = 0
             last_progress_update = time.time()
             self._last_bytes = 0
             self._last_update = time.time()
+            retry_count = 0
             
             with open(self.file_path, 'rb') as f:
                 while bytes_sent < file_size and self.running:
-                    chunk = f.read(self._chunk_size)
-                    if not chunk:
-                        break
+                    try:
+                        chunk = f.read(self._chunk_size)
+                        if not chunk:
+                            break
+                            
+                        def send_chunk():
+                            self.socket.sendall(chunk)
+                            return len(chunk)
+                            
+                        sent = self._handle_timeout(send_chunk)
+                        if sent is None:
+                            # 如果发送失败，尝试重试
+                            retry_count += 1
+                            if retry_count > self._retry_count:
+                                raise Exception(f"发送数据失败，已重试{self._retry_count}次")
+                            time.sleep(1)  # 等待1秒后重试
+                            continue
+                            
+                        bytes_sent += sent
+                        retry_count = 0  # 成功发送后重置重试计数
                         
-                    self.socket.sendall(chunk)
-                    bytes_sent += len(chunk)
-                    
-                    # 降低进度更新频率
-                    current_time = time.time()
-                    if current_time - last_progress_update >= self._progress_update_interval:
-                        progress = int((bytes_sent / file_size) * 100)
-                        self.signals.emit('progress_updated', progress)
-                        self._update_speed(bytes_sent)
-                        last_progress_update = current_time
+                        # 降低进度更新频率
+                        current_time = time.time()
+                        if current_time - last_progress_update >= self._progress_update_interval:
+                            progress = int((bytes_sent / file_size) * 100)
+                            self.signals.emit('progress_updated', progress)
+                            self._update_speed(bytes_sent)
+                            last_progress_update = current_time
+                            
+                        # 每发送一定量的数据后暂停一下，防止发送过快
+                        if bytes_sent % (self._chunk_size * 32) == 0:
+                            time.sleep(0.001)
+                            
+                    except socket.timeout:
+                        retry_count += 1
+                        if retry_count > self._retry_count:
+                            raise Exception(f"发送数据超时，已重试{self._retry_count}次")
+                        time.sleep(1)
+                        continue
+                    except Exception as e:
+                        raise Exception(f"发送数据时发生错误: {str(e)}")
 
             if bytes_sent == file_size:
                 self.signals.emit('progress_updated', 100)
@@ -121,6 +177,8 @@ class FileTransferThread(threading.Thread):
         except Exception as e:
             self.signals.emit('error_occurred', f"上传失败: {str(e)}")
             self.signals.emit('status_updated', "传输失败")
+        finally:
+            self.running = False
 
     def _calculate_md5(self):
         md5_hash = hashlib.md5()
@@ -243,6 +301,10 @@ class FileTransferWindow(ctk.CTk):
         
         # 在UI设置完成后，再进行其他初始化
         self.after(100, self.post_init)  # 使用after延迟执行其他初始化操作
+
+        self.transfer_queue = []
+        self.is_transferring = False
+        self.transfer_items = {}  # 用于存储传输项的字典
 
     def post_init(self):
         """UI加载完成后的初始化操作"""
@@ -460,26 +522,49 @@ class FileTransferWindow(ctk.CTk):
         )
         refresh_btn.pack(pady=5)
         
-        # 底部进度显示
-        progress_frame = ctk.CTkFrame(self)
-        progress_frame.pack(fill="x", padx=10, pady=5)
+        # 添加传输列表框架
+        transfer_list_frame = ctk.CTkFrame(self)
+        transfer_list_frame.pack(fill="x", padx=10, pady=5)
         
-        self.current_file_label = ctk.CTkLabel(progress_frame, text="当前文件: 无")
-        self.current_file_label.pack(side="left")
+        # 添加标题和速度显示
+        title_frame = ctk.CTkFrame(transfer_list_frame)
+        title_frame.pack(fill="x", padx=5, pady=2)
         
-        self.transfer_status = ctk.CTkLabel(progress_frame, text="传输速度: 0 MB/s")
-        self.transfer_status.pack(side="left", padx=10)
+        ctk.CTkLabel(title_frame, text="传输队列").pack(side="left", padx=5)
+        self.transfer_status = ctk.CTkLabel(title_frame, text="传输速度: 0 MB/s")
+        self.transfer_status.pack(side="right", padx=5)
         
-        self.progress_bar = ctk.CTkProgressBar(progress_frame)
-        self.progress_bar.pack(fill="x", expand=True, padx=10)
-        self.progress_bar.set(0)
+        # 添加传输列表
+        list_frame = ctk.CTkFrame(transfer_list_frame)
+        list_frame.pack(fill="x", expand=True, padx=5, pady=2)
+        
+        # 添加滚动条
+        scrollbar = ttk.Scrollbar(list_frame)
+        scrollbar.pack(side="right", fill="y")
+        
+        self.transfer_list = ttk.Treeview(
+            list_frame,
+            columns=("name", "size", "status", "progress"),
+            show="headings",
+            height=3  # 显示3行
+        )
+        
+        self.transfer_list.heading("name", text="文件名")
+        self.transfer_list.heading("size", text="大小")
+        self.transfer_list.heading("status", text="状态")
+        self.transfer_list.heading("progress", text="进度")
+        
+        self.transfer_list.column("name", width=200)
+        self.transfer_list.column("size", width=100)
+        self.transfer_list.column("status", width=100)
+        self.transfer_list.column("progress", width=100)
+        
+        self.transfer_list.pack(fill="x", expand=True)
+        scrollbar.config(command=self.transfer_list.yview)
+        self.transfer_list.configure(yscrollcommand=scrollbar.set)
         
     def setup_signals(self):
         """设置所有信号连接"""
-        # 进度更新信号
-        self.signals.connect('progress_updated', 
-            lambda value: self.after(0, lambda: self.progress_bar.set(value / 100.0)))
-        
         # 传输完成信号
         self.signals.connect('transfer_completed', 
             lambda msg: self.after(0, lambda: self.on_transfer_completed(msg)))
@@ -494,11 +579,11 @@ class FileTransferWindow(ctk.CTk):
         
         # 速度更新信号
         self.signals.connect('speed_updated', 
-            lambda speed: self.after(0, lambda: self.transfer_status.configure(text=speed)))
+            lambda speed: self.after(0, lambda: self.update_speed_display(speed)))
         
         # 状态更新信号
         self.signals.connect('status_updated',
-            lambda status: self.after(0, lambda: self.current_file_label.configure(text=status)))
+            lambda status: self.after(0, lambda: self.status_label.configure(text=status)))
 
     def transfer_selected_file(self):
         """处理文件传输"""
@@ -511,7 +596,7 @@ class FileTransferWindow(ctk.CTk):
         if not selected_items:
             return
         
-        # 处理选中的文件
+        # 将所有选中的文件添加到传输队列
         for item in selected_items:
             values = self.local_list.item(item)['values']
             if not values or values[0] != "文件":  # 检查是否为文件
@@ -523,17 +608,136 @@ class FileTransferWindow(ctk.CTk):
             if not os.path.isfile(file_path):
                 continue
             
-            # 创建并启动传输线程
-            self.transfer_thread = FileTransferThread(
-                self.client_socket,
-                file_path,
-                self.current_remote_directory or os.path.join(os.path.expanduser("~"), "Downloads"),
-                is_upload=True,
-                signals=self.signals
-            )
+            file_size = os.path.getsize(file_path)
+            self.add_transfer_item(file_path, file_size)  # 添加到传输列表
+                
+            self.transfer_queue.append({
+                'file_path': file_path,
+                'save_path': self.current_remote_directory or os.path.join(os.path.expanduser("~"), "Downloads")
+            })
+        
+        # 如果当前没有在传输，开始传输队列
+        if not self.is_transferring:
+            self.process_transfer_queue()
+    
+    def process_transfer_queue(self):
+        """处理传输队列"""
+        if not self.transfer_queue or self.is_transferring:
+            return
             
-            # 启动线程
-            self.transfer_thread.start()
+        self.is_transferring = True
+        try:
+            # 获取队列中的下一个文件
+            file_info = self.transfer_queue[0]  # 不立即移除，等传输成功后再移除
+            file_path = file_info['file_path']
+            
+            # 更新传输状态
+            self.update_transfer_item(file_path, status="传输中", progress=0)
+            
+            if file_info.get('is_pull', False):
+                # 创建新的信号处理器
+                signals = FileTransferSignals()
+                
+                def on_transfer_complete(msg):
+                    self.is_transferring = False
+                    self.update_transfer_item(file_path, status="完成", progress=100)
+                    self.transfer_queue.pop(0)  # 传输成功后移除
+                    # 继续处理队列中的下一个文件
+                    self.after(100, self.process_transfer_queue)
+                    
+                def on_transfer_error(msg):
+                    self.is_transferring = False
+                    self.update_transfer_item(file_path, status="失败")
+                    self.transfer_queue.pop(0)  # 传输失败后移除
+                    self.error_label.configure(text=f"传输错误: {msg}")
+                    self.after(3000, lambda: self.error_label.configure(text=""))
+                    # 继续处理队列中的下一个文件
+                    self.after(1000, self.process_transfer_queue)
+                
+                # 进度更新处理
+                def on_progress_update(progress):
+                    self.update_transfer_item(file_path, progress=progress)
+                    
+                # 速度更新处理
+                def on_speed_update(speed):
+                    self.transfer_status.configure(text=f"传输速度: {speed}")
+                
+                # 连接信号到新的处理器
+                signals.connect('transfer_completed', on_transfer_complete)
+                signals.connect('error_occurred', on_transfer_error)
+                signals.connect('progress_updated', on_progress_update)
+                signals.connect('speed_updated', on_speed_update)
+                
+                # 发送拉取请求
+                request = {
+                    'type': 'pull_request',
+                    'file_names': [os.path.basename(file_path)],
+                    'paths': [os.path.dirname(file_path)],
+                    'save_paths': [file_info['save_path']]
+                }
+                message = json.dumps(request) + "<<END>>"
+                self.client_socket.send(message.encode())
+                
+                # 保存信号处理器
+                self.signals = signals
+                
+            else:
+                # 创建并启动传输线程
+                self.transfer_thread = FileTransferThread(
+                    self.client_socket,
+                    file_path,
+                    file_info['save_path'],
+                    is_upload=True,
+                    signals=self.signals
+                )
+                
+                # 创建新的信号处理器
+                signals = FileTransferSignals()
+                
+                def on_transfer_complete(msg):
+                    self.is_transferring = False
+                    self.update_transfer_item(file_path, status="完成", progress=100)
+                    self.transfer_queue.pop(0)  # 传输成功后移除
+                    # 继续处理队列中的下一个文件
+                    self.after(100, self.process_transfer_queue)
+                    
+                def on_transfer_error(msg):
+                    self.is_transferring = False
+                    self.update_transfer_item(file_path, status="失败")
+                    self.transfer_queue.pop(0)  # 传输失败后移除
+                    self.error_label.configure(text=f"传输错误: {msg}")
+                    self.after(3000, lambda: self.error_label.configure(text=""))
+                    # 继续处理队列中的下一个文件
+                    self.after(1000, self.process_transfer_queue)
+                
+                # 进度更新处理
+                def on_progress_update(progress):
+                    self.update_transfer_item(file_path, progress=progress)
+                    
+                # 速度更新处理
+                def on_speed_update(speed):
+                    self.transfer_status.configure(text=f"传输速度: {speed}")
+                
+                # 连接信号到新的处理器
+                signals.connect('transfer_completed', on_transfer_complete)
+                signals.connect('error_occurred', on_transfer_error)
+                signals.connect('progress_updated', on_progress_update)
+                signals.connect('speed_updated', on_speed_update)
+                
+                # 设置线程的信号
+                self.transfer_thread.signals = signals
+                
+                # 启动线程
+                self.transfer_thread.start()
+            
+        except Exception as e:
+            self.is_transferring = False
+            if 'file_path' in locals():
+                self.update_transfer_item(file_path, status="失败")
+            self.error_label.configure(text=f"传输错误: {str(e)}")
+            self.after(3000, lambda: self.error_label.configure(text=""))
+            # 继续处理队列中的下一个文件
+            self.after(1000, self.process_transfer_queue)
 
     def send_file(self, file_path):
         try:
@@ -548,7 +752,7 @@ class FileTransferWindow(ctk.CTk):
                 
             # 计算文件MD5
             md5_value = self.calculate_md5(file_path)
-            self.current_file_label.configure(text=f"正在发送: {file_name}")
+            self.signals.emit('status_updated', f"正在发送: {file_name}")
             
             save_path = self.current_remote_directory
             if not save_path:
@@ -759,6 +963,7 @@ class FileTransferWindow(ctk.CTk):
 
     def handle_file_transfer(self, message, remaining):
         """处理文件传输消息"""
+        full_save_path = None
         try:
             # 解析文件信息
             file_info = message.split('|')
@@ -772,19 +977,19 @@ class FileTransferWindow(ctk.CTk):
                 save_path = os.path.join(os.path.expanduser("~"), "Downloads")
 
             print(f"保存文件到: {save_path}")
-            self.current_file_label.configure(text=f"正在接收: {file_name}")
+            self.signals.emit('status_updated', f"正在接收: {file_name}")
 
             # 创建保存目录
             os.makedirs(save_path, exist_ok=True)
             full_save_path = os.path.join(save_path, file_name)
 
             # 优化socket配置
-            self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 524288)  # 512KB接收缓冲区
-            self.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # 禁用Nagle算法
+            self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 524288)
+            self.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             
             # 接收文件内容
             self.last_transfer_time = time.time()
-            with open(full_save_path, 'wb', buffering=262144) as f:  # 使用256KB的文件缓冲区
+            with open(full_save_path, 'wb', buffering=262144) as f:
                 bytes_received = 0
                 if remaining:
                     f.write(remaining)
@@ -799,12 +1004,14 @@ class FileTransferWindow(ctk.CTk):
                         bytes_received += len(chunk)
                         
                         # 降低进度更新频率
-                        if bytes_received % (262144 * 4) == 0:  # 每接收1MB更新一次进度
+                        if bytes_received % (262144 * 4) == 0:
                             progress = int((bytes_received / file_size) * 100)
                             self.signals.emit('progress_updated', progress)
                             self.calculate_speed(bytes_received)
                     except socket.timeout:
                         continue
+                    except Exception as e:
+                        raise ConnectionError(f"接收数据失败: {str(e)}")
 
             # 验证文件MD5
             received_md5 = self.calculate_md5(full_save_path)
@@ -812,7 +1019,7 @@ class FileTransferWindow(ctk.CTk):
                 raise ValueError("文件校验失败，传输可能不完整")
 
             self.signals.emit('transfer_completed', f"已接收: {file_name}")
-            self.signals.emit('speed_updated', "传输速度: 0 B/s")
+            self.signals.emit('speed_updated', "0 MB/s")
 
             if not self.is_server:
                 print("文件接收完成，请求更新文件列表")
@@ -821,6 +1028,12 @@ class FileTransferWindow(ctk.CTk):
         except Exception as e:
             print(f"文件接收失败: {str(e)}")
             self.signals.emit('error_occurred', f"文件接收失败: {str(e)}")
+            # 如果文件接收失败，删除未完成的文件
+            if full_save_path and os.path.exists(full_save_path):
+                try:
+                    os.remove(full_save_path)
+                except:
+                    pass
             raise
 
     def get_local_ip(self):
@@ -931,16 +1144,17 @@ class FileTransferWindow(ctk.CTk):
         self.status_label.configure(text="等待连接...")
         self.connect_button.configure(text="连接")
         self.ip_combo.configure(state="normal")
-        self.progress_bar.set(0)
-        self.current_file_label.configure(text="当前文件: 无")
         self.transfer_status.configure(text="传输速度: 0 MB/s")
         self.error_label.configure(text="")
         self.is_server = True
         
+        # 清理传输队列和列表
+        self.transfer_queue.clear()
+        self.clear_transfer_list()
+        self.is_transferring = False
+
     def on_transfer_completed(self, message):
         """传输完成处理"""
-        self.current_file_label.configure(text=message)
-        self.progress_bar.set(100)
         self.transfer_status.configure(text="传输速度: 0 MB/s")
         
     def on_error(self, error_msg):
@@ -949,6 +1163,8 @@ class FileTransferWindow(ctk.CTk):
             self.error_label.configure(text="连接已断开")
         elif "10061" in error_msg:  # 连接被拒绝
             self.error_label.configure(text="连接被拒绝")
+        elif "10054" in error_msg:  # 连接被强制关闭
+            self.error_label.configure(text="连接被对方关闭")
         else:
             self.error_label.configure(text="传输错误")
         
@@ -956,8 +1172,7 @@ class FileTransferWindow(ctk.CTk):
         self.after(3000, lambda: self.error_label.configure(text=""))
         
         # 重置状态
-        self.progress_bar.set(0)
-        self.current_file_label.configure(text="当前文件: 无")
+        self.transfer_status.configure(text="传输速度: 0 MB/s")
         self.disconnect_peer()
         
     def close(self):
@@ -1173,65 +1388,61 @@ class FileTransferWindow(ctk.CTk):
         if not selected_items:
             return
         
-        # 直接处理选中的文件
+        # 将选中的文件添加到传输队列
         for item in selected_items:
             values = self.remote_list.item(item)['values']
             if not values or values[0] != "文件":  # 检查是否为文件
                 continue
             
             file_name = values[1]  # 获取文件名
+            file_size_str = values[2]  # 获取文件大小字符串
             
-            # 构造拉取请求
-            request = {
-                'type': 'pull_request',
-                'file_names': [file_name],
-                'paths': [self.current_remote_directory],
-                'save_paths': [self.current_local_directory or os.path.join(os.path.expanduser("~"), "Downloads")]
+            # 将文件大小字符串转换为字节数
+            try:
+                file_size = self.parse_size_str(file_size_str)
+            except:
+                file_size = 0
+            
+            # 添加到传输列表UI
+            file_path = os.path.join(self.current_remote_directory, file_name)
+            self.add_transfer_item(file_path, file_size)
+            
+            # 添加到传输队列
+            self.transfer_queue.append({
+                'file_path': file_path,
+                'save_path': self.current_local_directory or os.path.join(os.path.expanduser("~"), "Downloads"),
+                'is_pull': True  # 标记这是一个拉取请求
+            })
+        
+        # 如果当前没有在传输，开始传输队列
+        if not self.is_transferring:
+            self.process_transfer_queue()
+
+    def parse_size_str(self, size_str):
+        """将大小字符串转换为字节数"""
+        try:
+            match = re.match(r"([\d.]+)([KMGT]?B)", size_str)
+            if not match:
+                return 0
+                
+            number = float(match.group(1))
+            unit = match.group(2)
+            
+            multipliers = {
+                'B': 1,
+                'KB': 1024,
+                'MB': 1024 ** 2,
+                'GB': 1024 ** 3,
+                'TB': 1024 ** 4
             }
             
-            try:
-                message = json.dumps(request) + "<<END>>"
-                self.client_socket.send(message.encode())
-            except Exception as e:
-                print(f"发送拉取请求失败: {str(e)}")
-                self.error_label.configure(text=f"发送拉取请求失败: {str(e)}")
-                self.after(3000, lambda: self.error_label.configure(text=""))
-
-    def handle_pull_request(self, msg_data):
-        """处理文件拉取请求"""
-        try:
-            file_names = msg_data['file_names']
-            paths = msg_data.get('paths', [])
-            save_paths = msg_data.get('save_paths', [])
-
-            if not paths:
-                raise Exception("无效的文件路径")
-
-            for file_name, path, save_path in zip(file_names, paths, save_paths):
-                file_path = os.path.join(path, file_name)
-                if not os.path.isfile(file_path):
-                    raise Exception(f"文件 {file_name} 不存在")
-
-                # 创建并启动传输线程
-                self.transfer_thread = FileTransferThread(
-                    self.client_socket, 
-                    file_path, 
-                    save_path, 
-                    is_upload=True,
-                    signals=self.signals
-                )
-                
-                # 启动线程
-                self.transfer_thread.start()
-
-        except Exception as e:
-            print(f"处理拉取请求失败: {str(e)}")
-            self.error_label.configure(text=f"处理拉取请求失败: {str(e)}")
-            self.after(3000, lambda: self.error_label.configure(text=""))
+            return int(number * multipliers.get(unit, 1))
+        except:
+            return 0
 
     def update_status(self, status):
         """更新状态显示"""
-        self.current_file_label.configure(text=status)
+        self.transfer_status.configure(text=status)
 
     def update_progress(self, value):
         """更新进度条"""
@@ -1239,7 +1450,7 @@ class FileTransferWindow(ctk.CTk):
 
     def update_speed_display(self, speed):
         """更新速度显示"""
-        self.transfer_status.configure(text=speed)
+        self.transfer_status.configure(text=f"传输速度: {speed}")
 
     def calculate_speed(self, total_bytes):
         """计算实际每秒传输速度"""
@@ -1424,3 +1635,126 @@ class FileTransferWindow(ctk.CTk):
         
         # 切换排序方向
         tree.heading(col, command=lambda: self.treeview_sort_column(tree, col, not reverse)) 
+
+    def add_transfer_item(self, file_path, size):
+        """添加传输项到列表"""
+        file_name = os.path.basename(file_path)
+        size_str = self.format_size(size)
+        item = self.transfer_list.insert("", "end", values=(file_name, size_str, "等待中", "0%"))
+        self.transfer_items[file_path] = item
+        return item
+
+    def update_transfer_item(self, file_path, status=None, progress=None):
+        """更新传输项状态"""
+        if file_path in self.transfer_items:
+            item = self.transfer_items[file_path]
+            current_values = self.transfer_list.item(item)['values']
+            new_values = list(current_values)
+            
+            if status is not None:
+                new_values[2] = status
+            if progress is not None:
+                new_values[3] = f"{progress}%"
+                
+            self.transfer_list.item(item, values=tuple(new_values))
+            
+            # 如果传输完成或失败，从字典中移除
+            if status in ["完成", "失败"]:
+                self.after(3000, lambda: self.remove_transfer_item(file_path))
+
+    def remove_transfer_item(self, file_path):
+        """从列表中移除传输项"""
+        if file_path in self.transfer_items:
+            item = self.transfer_items[file_path]
+            self.transfer_list.delete(item)
+            del self.transfer_items[file_path]
+
+    def clear_transfer_list(self):
+        """清空传输列表"""
+        self.transfer_list.delete(*self.transfer_list.get_children())
+        self.transfer_items.clear() 
+
+    def handle_pull_request(self, msg_data):
+        """处理文件拉取请求"""
+        try:
+            file_names = msg_data['file_names']
+            paths = msg_data.get('paths', [])
+            save_paths = msg_data.get('save_paths', [])
+
+            if not paths:
+                raise Exception("无效的文件路径")
+
+            for file_name, path, save_path in zip(file_names, paths, save_paths):
+                file_path = os.path.join(path, file_name)
+                if not os.path.isfile(file_path):
+                    raise Exception(f"文件 {file_name} 不存在")
+                
+                # 获取文件大小
+                file_size = os.path.getsize(file_path)
+                
+                # 添加到传输列表UI
+                self.add_transfer_item(file_path, file_size)
+                
+                # 创建并启动传输线程
+                transfer_thread = FileTransferThread(
+                    self.client_socket,
+                    file_path,
+                    save_path,
+                    is_upload=True,
+                    signals=self.signals
+                )
+                
+                # 创建新的信号处理器
+                signals = FileTransferSignals()
+                
+                def on_transfer_complete(msg):
+                    self.is_transferring = False
+                    self.update_transfer_item(file_path, status="完成", progress=100)
+                    self.signals.emit('status_updated', "传输完成")
+                    # 继续处理队列中的下一个文件
+                    self.after(100, self.process_transfer_queue)
+                    
+                def on_transfer_error(msg):
+                    self.is_transferring = False
+                    self.update_transfer_item(file_path, status="失败")
+                    self.signals.emit('status_updated', f"传输错误: {msg}")
+                    self.error_label.configure(text=f"传输错误: {msg}")
+                    self.after(3000, lambda: self.error_label.configure(text=""))
+                    # 继续处理队列中的下一个文件
+                    self.after(1000, self.process_transfer_queue)
+                
+                # 进度更新处理
+                def on_progress_update(progress):
+                    self.update_transfer_item(file_path, progress=progress)
+                    self.signals.emit('progress_updated', progress)
+                    
+                # 速度更新处理
+                def on_speed_update(speed):
+                    self.signals.emit('speed_updated', speed)
+                    self.transfer_status.configure(text=f"传输速度: {speed}")
+                
+                # 状态更新处理
+                def on_status_update(status):
+                    self.signals.emit('status_updated', status)
+                
+                # 连接信号到新的处理器
+                signals.connect('transfer_completed', on_transfer_complete)
+                signals.connect('error_occurred', on_transfer_error)
+                signals.connect('progress_updated', on_progress_update)
+                signals.connect('speed_updated', on_speed_update)
+                signals.connect('status_updated', on_status_update)
+                
+                # 设置线程的信号
+                transfer_thread.signals = signals
+                
+                # 更新初始状态
+                self.signals.emit('status_updated', f"正在发送: {file_name}")
+                self.update_transfer_item(file_path, status="传输中", progress=0)
+                
+                # 启动线程
+                transfer_thread.start()
+
+        except Exception as e:
+            print(f"处理拉取请求失败: {str(e)}")
+            self.error_label.configure(text=f"处理拉取请求失败: {str(e)}")
+            self.after(3000, lambda: self.error_label.configure(text="")) 

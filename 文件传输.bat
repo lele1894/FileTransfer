@@ -1,1 +1,1 @@
-python G:\GitHub\FileTransfer\main.py
+python D:\GithHub\FileTransfer\main.py
